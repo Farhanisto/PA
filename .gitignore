@@ -218,3 +218,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PA local data (never commit credentials or user data)
+pa.db*
+pa_checkpoints.db*
+# legacy (pre-rename) artifacts
+privateos.db*
+privateos_checkpoints.db*
+*.db-journal
+.dump.rdb

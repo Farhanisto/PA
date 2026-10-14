@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pa"
+version = "0.1.0"
+description = "PA — personal AI assistant with LangGraph, Celery, FastAPI"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic-settings",
+  "python-dotenv",
+  "httpx",
+  "langgraph",
+  "langgraph-checkpoint-sqlite",
+  "langchain-core",
+  "langchain-openai",
+  "celery[redis]",
+  "redis",
+  "sqlalchemy",
+  "gradio>=4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "httpx", "ruff", "mypy"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
