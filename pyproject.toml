@@ -13,6 +13,7 @@ dependencies = [
   "pydantic-settings",
   "python-dotenv",
   "httpx",
+  "alembic",
   "langgraph",
   "langgraph-checkpoint-sqlite",
   "langchain-core",
@@ -20,7 +21,11 @@ dependencies = [
   "celery[redis]",
   "redis",
   "sqlalchemy",
-  "gradio>=4",
+  "psycopg[binary]",
+  "langgraph-checkpoint-postgres",
+  # Pinned: 0.28 deprecates connected_accounts.initiate() for managed OAuth
+  # and reshapes auth_configs.list(); a floating range silently breaks connect.
+  "composio==0.28.0",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +33,10 @@ dev = ["pytest", "pytest-asyncio", "httpx", "ruff", "mypy"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# Alembic migrations must ship with the installed package.
+pa = ["db/migrations/*.mako", "db/migrations/versions/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

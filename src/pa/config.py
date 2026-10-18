@@ -15,8 +15,9 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     APP_HOST: str = "127.0.0.1"
     APP_PORT: int = 8000
+    APP_CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
 
-    DATABASE_URL: str = "sqlite:///./pa.db"
+    DATABASE_URL: str = "postgresql+psycopg://pa:pa@localhost:5432/pa"
 
     REDIS_URL: str = "redis://localhost:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"
@@ -27,17 +28,16 @@ class Settings(BaseSettings):
     NEBIUS_TIMEOUT: float = 60.0
     NEBIUS_MAX_TOKENS: int = 2048
 
-    # App integrations (requirement). Empty = mock mode with seeded data.
-    GMAIL_ADDRESS: str = ""
-    GMAIL_APP_PASSWORD: str = ""
-    TWILIO_ACCOUNT_SID: str = ""
-    TWILIO_AUTH_TOKEN: str = ""
-    TWILIO_WHATSAPP_FROM: str = ""
-    ZOOM_ACCOUNT_ID: str = ""
-    ZOOM_CLIENT_ID: str = ""
-    ZOOM_CLIENT_SECRET: str = ""
+    GROQ_API_KEY: str = ""
+    GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
+    GROQ_TIMEOUT: float = 60.0
+    GROQ_MAX_TOKENS: int = 2048
 
-    LANGGRAPH_CHECKPOINT_DB: str = "./pa_checkpoints.db"
+    COMPOSIO_API_KEY: str = ""
+    COMPOSIO_CALLBACK_URL: str = ""
+
+    LANGGRAPH_CHECKPOINT_DB: str = "postgresql+psycopg://pa:pa@localhost:5432/pa"
 
     @property
     def is_production(self) -> bool:

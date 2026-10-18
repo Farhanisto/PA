@@ -1,5 +1,6 @@
 """Pydantic request/response schemas."""
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -15,6 +16,10 @@ class AssistantTaskResponse(BaseModel):
     status: str
 
 
+class BriefingRequest(BaseModel):
+    scheduled_for: str = Field(default="", max_length=128)
+
+
 class JobResponse(BaseModel):
     job_id: str
     thread_id: str
@@ -22,6 +27,9 @@ class JobResponse(BaseModel):
     request: str
     result: str | None = None
     error_code: str | None = None
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
 
 
 class ApprovalResponse(BaseModel):
@@ -42,19 +50,6 @@ class MemoryResponse(BaseModel):
     id: str
     content: str
     category: str
-
-
-class IntegrationStatus(BaseModel):
-    provider: str
-    configured: bool
-    mode: str
-    description: str
-
-
-class IntegrationConnectResponse(BaseModel):
-    provider: str
-    connected: bool
-    mode: str | None = None
 
 
 class GmailMessage(BaseModel):

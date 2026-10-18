@@ -1,86 +1,195 @@
-"""Connected-app endpoints — status and read-only views.
+"""Connected-app endpoints.
 
-Sends are never exposed here: outbound actions (email, WhatsApp, meetings)
-only execute through approval-gated assistant workflows.
+Two shapes:
+- ``GET /api/v1/apps`` — public catalog of connectable apps (no auth needed,
+  so the UI can show what is available before sign-in).
+- ``GET /api/v1/integrations`` — the caller's connection state (auth required).
+
+Sending is never exposed here: outbound actions only run through
+approval-gated workflows.
 """
+
+from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from pa.api.dependencies import get_current_user_id, get_db
-from pa.integrations import manager
-from pa.schemas.assistant import GmailMessage, IntegrationConnectResponse, IntegrationStatus
+from pa.api.dependencies import get_current_user, get_db, get_optional_user
+from composio_client import (
+    AuthenticationError,
+    ComposioError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
-router = APIRouter()
+from pa.db import repositories
+from pa.integrations import catalog as catalog_mod
+from pa.integrations import composio_client
+from pa.schemas.auth import AppResponse, ConnectionResponse
+
+router = APIRouter(tags=["integrations"])
+
+
+def _composio_http_error(exc: Exception) -> HTTPException:
+    """Turn a Composio SDK failure into a message the user can act on.
+
+    The SDK raises its own ComposioError hierarchy (permission denied,
+    authentication, rate limit...), which is neither ValueError nor
+    RuntimeError; without this it surfaced as an opaque 500.
+    """
+    name = type(exc).__name__
+    detail = str(exc).strip() or name
+    if isinstance(exc, PermissionDeniedError):
+        return HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                "The Composio API key lacks permission for this action "
+                f"({detail}). Widen the key's scopes in the Composio dashboard."
+            ),
+        )
+    if isinstance(exc, AuthenticationError):
+        return HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Composio rejected the API key: {detail}",
+        )
+    if isinstance(exc, RateLimitError):
+        return HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail)
+    return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Composio error: {detail}")
+
+
+@router.get(
+    "/apps",
+    response_model=list[AppResponse],
+    summary="Browse connectable apps",
+    description="Public. Lists the apps available to connect via Composio, with this user's connection state when signed in.",
+)
+def list_apps(
+    user_id: str | None = Depends(get_optional_user),
+    refresh: bool = Query(default=False, description="Ignored; catalog is fetched live."),
+):
+    apps = catalog_mod.list_apps()
+    states = catalog_mod.connection_states(user_id, [a["slug"] for a in apps]) if user_id else {}
+    return [
+        AppResponse(
+            slug=a["slug"],
+            name=a["name"],
+            description=a["description"],
+            logo=a["logo"],
+            state=states.get(a["slug"], "none"),
+        )
+        for a in apps
+    ]
+
+
+@router.get(
+    "/apps/status",
+    summary="Catalog reachability",
+    description="Public. Explains whether the app catalog is available and, if not, why.",
+)
+def apps_status():
+    st = catalog_mod.catalog_status()
+    return {
+        "configured": st["configured"] == "true",
+        "reachable": st["reachable"] == "true",
+        "app_count": int(st["app_count"]),
+        "reason": st["reason"],
+    }
 
 
 @router.get(
     "/integrations",
-    response_model=list[IntegrationStatus],
-    summary="List connected apps",
-    description="Providers with server-side configuration state (mock vs live). Never includes secrets.",
+    response_model=list[ConnectionResponse],
+    summary="My connections",
+    description="Apps the current user has connected, with per-app state.",
 )
-def list_integrations():
-    """List Gmail/WhatsApp/Zoom connection state."""
-    return [IntegrationStatus(**s) for s in manager.connected_accounts()]
+def list_connections(
+    user_id: str = Depends(get_current_user),
+):
+    apps = catalog_mod.list_apps()
+    states = catalog_mod.connection_states(user_id, [a["slug"] for a in apps])
+    out = []
+    for a in apps:
+        state = states.get(a["slug"], "none")
+        if state == "none":
+            # Only surface what is actually connected (or mid-flight).
+            continue
+        out.append(
+            ConnectionResponse(
+                provider=a["slug"], name=a["name"], connected=state == "active", state=state
+            )
+        )
+    return out
 
 
 @router.post(
     "/integrations/{provider}/connect",
-    response_model=IntegrationConnectResponse,
-    summary="Connect an app",
-    description="Verifies server-side credentials exist for the provider and records an audit event. Idempotent.",
+    response_model=dict,
+    summary="Start connecting an app",
+    description=(
+        "Begins the Composio OAuth flow and returns a sign-in URL. The user must "
+        "approve access before the assistant can act on the app."
+    ),
 )
-def connect_integration(
-    provider: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)
+def connect(
+    provider: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+    org_id: str | None = Query(
+        default=None, description="Business scope; omit for a personal link."
+    ),
 ):
-    """Connect Gmail, WhatsApp, or Zoom for the current user."""
+    """Start OAuth for an app. The user authorises it in the returned URL."""
     try:
-        status_payload = manager.connect(db, user_id=user_id, provider=provider)
+        out = composio_client.initiate_connection(user_id, provider, org_id=org_id)
     except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    return IntegrationConnectResponse(
-        provider=provider, connected=True, mode=status_payload.get("mode")
+    except ComposioError as exc:
+        raise _composio_http_error(exc)
+    repositories.create_audit_event(
+        db,
+        event_type="integration.connect_started",
+        user_id=user_id,
+        details={"provider": provider, "org_id": org_id or ""},
     )
+    return {"provider": provider, "redirect_url": out["redirect_url"]}
+
+
+@router.get(
+    "/integrations/{provider}/status",
+    summary="Connection state for an app",
+    description="active | pending | none | unavailable.",
+)
+def connection_status(provider: str, user_id: str = Depends(get_current_user)):
+    try:
+        state = composio_client.connection_state(user_id, provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    return {"provider": provider, "state": state}
 
 
 @router.delete(
-    "/integrations/{provider}/disconnect",
-    response_model=IntegrationConnectResponse,
+    "/integrations/{provider}",
     summary="Disconnect an app",
-    description="Records a disconnect audit event. Server-side credentials are managed by the operator.",
+    description="Revokes the user's Composio connection and records an audit event.",
 )
-def disconnect_integration(
-    provider: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)
+def disconnect(
+    provider: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+    org_id: str | None = Query(
+        default=None, description="Business scope; omit for a personal link."
+    ),
 ):
-    """Disconnect a provider for the current user."""
     try:
-        manager.disconnect(db, user_id=user_id, provider=provider)
+        revoked = composio_client.revoke_connection(user_id, provider, org_id=org_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    return IntegrationConnectResponse(provider=provider, connected=False)
-
-
-@router.get(
-    "/integrations/gmail/inbox",
-    response_model=list[GmailMessage],
-    summary="Read Gmail inbox",
-    description="Read-only triage view of recent messages (mock data unless Gmail is configured).",
-)
-def gmail_inbox(limit: int = Query(default=10, ge=1, le=25)):
-    """Read recent Gmail messages."""
-    from pa.integrations.gmail import GmailConnector
-
-    return [GmailMessage(**m) for m in GmailConnector().read_inbox(limit)]
-
-
-@router.get(
-    "/integrations/zoom/meetings",
-    summary="List Zoom meetings",
-    description="Read-only view of upcoming meetings (mock data unless Zoom is configured).",
-)
-def zoom_meetings():
-    """List upcoming Zoom meetings."""
-    from pa.integrations.zoom import ZoomConnector
-
-    return ZoomConnector().list_meetings()
+    repositories.create_audit_event(
+        db,
+        event_type="integration.disconnected",
+        user_id=user_id,
+        details={"provider": provider, "revoked": revoked},
+    )
+    return {"provider": provider, "revoked": revoked}

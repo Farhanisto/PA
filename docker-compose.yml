@@ -12,24 +12,46 @@ services:
       timeout: 3s
       retries: 10
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pa
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pa}
+      POSTGRES_DB: pa
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pa -d pa"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
   api:
     build: .
     ports:
       - "127.0.0.1:8000:8000"
     environment:
       APP_ENV: ${APP_ENV:-production}
-      DATABASE_URL: sqlite:////data/pa.db
-      LANGGRAPH_CHECKPOINT_DB: /data/pa_checkpoints.db
+      DATABASE_URL: postgresql+psycopg://pa:pa@postgres:5432/pa
+      LANGGRAPH_CHECKPOINT_DB: postgresql+psycopg://pa:pa@postgres:5432/pa
       REDIS_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
-      PA_FAKE_MODEL: ${PA_FAKE_MODEL:-1}
       NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
+      COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
+      COMPOSIO_CALLBACK_URL: ${COMPOSIO_CALLBACK_URL:-}
       NEBIUS_BASE_URL: ${NEBIUS_BASE_URL:-https://api.tokenfactory.nebius.com/v1/}
       NEBIUS_MODEL: ${NEBIUS_MODEL:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
     volumes:
       - pa_data:/data
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
@@ -42,45 +64,73 @@ services:
     command: celery -A pa.queue.celery_app:celery_app worker --loglevel=INFO --concurrency=1
     environment:
       APP_ENV: ${APP_ENV:-production}
-      DATABASE_URL: sqlite:////data/pa.db
-      LANGGRAPH_CHECKPOINT_DB: /data/pa_checkpoints.db
+      DATABASE_URL: postgresql+psycopg://pa:pa@postgres:5432/pa
+      LANGGRAPH_CHECKPOINT_DB: postgresql+psycopg://pa:pa@postgres:5432/pa
       REDIS_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
-      PA_FAKE_MODEL: ${PA_FAKE_MODEL:-1}
       NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
+      COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
+      COMPOSIO_CALLBACK_URL: ${COMPOSIO_CALLBACK_URL:-}
       NEBIUS_BASE_URL: ${NEBIUS_BASE_URL:-https://api.tokenfactory.nebius.com/v1/}
       NEBIUS_MODEL: ${NEBIUS_MODEL:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
     volumes:
       - pa_data:/data
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
       api:
         condition: service_healthy
 
-  ui:
+  beat:
     build: .
-    command: python -m pa.frontend
-    ports:
-      - "127.0.0.1:7860:7860"
+    command: celery -A pa.queue.celery_app:celery_app beat --loglevel=INFO
     environment:
       APP_ENV: ${APP_ENV:-production}
-      PA_UI_HOST: 0.0.0.0
-      PA_UI_PORT: 7860
-      DATABASE_URL: sqlite:////data/pa.db
-      LANGGRAPH_CHECKPOINT_DB: /data/pa_checkpoints.db
+      DATABASE_URL: postgresql+psycopg://pa:pa@postgres:5432/pa
+      LANGGRAPH_CHECKPOINT_DB: postgresql+psycopg://pa:pa@postgres:5432/pa
       REDIS_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
-      PA_FAKE_MODEL: ${PA_FAKE_MODEL:-1}
+      BRIEFING_HOUR: ${BRIEFING_HOUR:-7}
+      BRIEFING_MINUTE: ${BRIEFING_MINUTE:-0}
       NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
+      COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
+      COMPOSIO_CALLBACK_URL: ${COMPOSIO_CALLBACK_URL:-}
       NEBIUS_BASE_URL: ${NEBIUS_BASE_URL:-https://api.tokenfactory.nebius.com/v1/}
       NEBIUS_MODEL: ${NEBIUS_MODEL:-}
-    volumes:
-      - pa_data:/data
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  web:
+    build: ./web
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      HOSTNAME: 0.0.0.0
+      PORT: 3000
+      NEXT_PUBLIC_API_URL: http://127.0.0.1:8000
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
 
 volumes:
   redis_data:
   pa_data:
+  postgres_data:

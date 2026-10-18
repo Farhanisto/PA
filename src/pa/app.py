@@ -4,12 +4,18 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from pa.api.routes.approvals import router as approvals_router
 from pa.api.routes.assistant import router as assistant_router
+from pa.api.routes.auth import router as auth_router
+from pa.api.routes.email import router as email_router
+from pa.api.routes.evals import router as evals_router
 from pa.api.routes.integrations import router as integrations_router
 from pa.api.routes.jobs import router as jobs_router
 from pa.api.routes.memory import router as memory_router
+from pa.api.routes.observability import router as observability_router
 from pa.db.database import get_session_factory, init_db
 from pa.observability import set_correlation_id
 
@@ -17,6 +23,12 @@ from pa.observability import set_correlation_id
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    try:
+        from pa.graph.checkpointer import ensure_schema
+
+        ensure_schema()
+    except Exception:
+        pass
     yield
 
 
@@ -28,9 +40,10 @@ def create_app() -> FastAPI:
             "Personal AI assistant: submit tasks that run as background "
             "LangGraph workflows, approve sensitive actions, and manage "
             "user-scoped memory.\n\n"
-            "Auth (MVP): pass your user id as the `X-User-Id` header "
-            "(defaults to `demo-user`). Every response echoes an "
-            "`X-Correlation-Id` header for log correlation.\n\n"
+            "Auth: sign up or log in via `/api/v1/auth/*`. Authenticated calls "
+            "use the `pa_session` cookie or an `Authorization: Bearer` token. "
+            "Every response echoes an `X-Correlation-Id` header for log "
+            "correlation.\n\n"
             "Interactive docs: Swagger UI at `/docs`, ReDoc at `/redoc`, "
             "raw OpenAPI JSON at `/openapi.json`."
         ),
@@ -47,7 +60,7 @@ def create_app() -> FastAPI:
             {"name": "memory", "description": "User-scoped persistent memory CRUD."},
             {
                 "name": "integrations",
-                "description": "Connected apps (Gmail, WhatsApp, Zoom): status and read-only views.",
+                "description": "Browse and manage the user's Composio app connections.",
             },
             {"name": "ops", "description": "Liveness and readiness probes."},
         ],
@@ -62,6 +75,32 @@ def create_app() -> FastAPI:
         response.headers["X-Correlation-Id"] = cid
         return response
 
+    from pa.config import get_settings
+
+    from pa.integrations.gmail_composio import IntegrationNotReady
+
+    @app.exception_handler(IntegrationNotReady)
+    async def _integration_not_ready(_request: Request, exc: IntegrationNotReady):
+        """Tell the caller to connect the app instead of failing opaquely."""
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    origins = [o.strip() for o in get_settings().APP_CORS_ORIGINS.split(",") if o.strip()]
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "Accept", "X-Correlation-Id"],
+            allow_credentials=True,
+            expose_headers=["X-Correlation-Id"],
+            max_age=600,
+        )
+
+    # Auth first: everything else depends on get_current_user.
+    app.include_router(auth_router, prefix="/api/v1", tags=["auth"])
+    app.include_router(email_router, prefix="/api/v1")
+    app.include_router(observability_router, prefix="/api/v1")
+    app.include_router(evals_router, prefix="/api/v1")
     app.include_router(assistant_router, prefix="/api/v1", tags=["assistant"])
     app.include_router(jobs_router, prefix="/api/v1", tags=["jobs"])
     app.include_router(approvals_router, prefix="/api/v1", tags=["approvals"])

@@ -1,183 +1,99 @@
 # PA
 
-Personal AI assistant that remembers user-approved preferences, runs workflows in the background, and executes actions safely with human approval.
+**Multi-user AI assistant for all your apps.** PA connects to the tools you
+already use through Composio OAuth, so your app passwords are never stored by
+PA. Email is the first fully implemented workflow: PA summarises and prioritises
+your inbox, drafts replies for you to review and edit, and never sends anything
+without your explicit approval. New apps join the same catalog and connection
+model without a redeploy.
 
-Stack: **FastAPI + LangGraph + Celery + Redis + Nemotron (Nebius Token Factory) + SQLite + Gradio + pytest**.
+Stack: **FastAPI + LangGraph + Celery + Redis + Postgres + Next.js + Groq/Nebius + pytest**.
 
-> **Auth note (MVP):** user identity is derived from `X-User-Id` header (default `demo-user`) for local single-user demo. Do not expose publicly without real authentication, HTTPS, rate limiting, and secret management. See `instructions.md` §15.
+## Requirements coverage
 
-## Quickstart (local, no Docker)
+| # | Requirement | Where |
+|---|---|---|
+| 1 | Authentication | `pa/auth/` — scrypt hashing, opaque revocable sessions; `/api/v1/auth/*` |
+| 2 | App connections via Composio | `pa/integrations/` (Composio only); public `GET /api/v1/apps` |
+| 3 | Summarize / prioritize / deadlines | `pa/services/email_triage.py`, `email_service.py` |
+| 4 | Reply drafting | `email_service.generate_draft`, `/api/v1/email/drafts/generate` |
+| 5 | Approval-gated sending | `send-request` → `/approvals/{id}/approve` → `resume_approved_workflow` |
+| 6 | Proactive briefings + reminders | `pa/services/proactive.py` + celery beat |
+| 7 | Observability | `pa/services/tracing.py`; `/api/v1/observability/*` |
+| 8 | AI evaluations | `pa/services/evals.py`; `/api/v1/evals/*` |
+| 9 | Security & audit | per-user scoping everywhere, deny-by-default permissions, audit trail |
 
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env   # then set NEBIUS_API_KEY + NEBIUS_MODEL
-```
-
-Run 3 terminals:
-
-```bash
-# Terminal 1 — API
-uvicorn pa.app:app --reload --app-dir src
-
-# Terminal 2 — worker (needs Redis)
-docker compose up -d redis
-celery -A pa.queue.celery_app:celery_app worker --loglevel=INFO
-
-# Terminal 3 — tests
-pytest
-```
-
-## Quickstart (Docker — API + worker + UI + Redis)
+## Run it
 
 ```bash
+cp .env.example .env      # add GROQ_API_KEY and COMPOSIO_API_KEY
 docker compose up -d --build
 ```
 
-This starts `redis`, `api` (:8000), `worker`, and `ui` (:7860) with SQLite
-persisted in the `pa_data` volume. Containers default to `PA_FAKE_MODEL=1`
-(deterministic echo model); for real inference set `NEBIUS_API_KEY` and
-`NEBIUS_MODEL` in your shell (or a local export — never commit them) and
-restart:
+Open **http://localhost:3000**. You can browse the app catalog without an
+account; sign in only when you want to connect an app or manage your inbox.
+
+Services: `api` :8000 (Swagger at `/docs`), `web` :3000, `worker`, `beat`,
+`postgres`, `redis`. Schema is managed by Alembic (`init_db()` runs
+`alembic upgrade head` on startup).
+
+## How an email gets sent
+
+1. `POST /api/v1/email/sync` fetches and triages the mailbox.
+2. `POST /api/v1/email/drafts/generate` drafts a reply; the user edits it.
+3. `POST /api/v1/email/drafts/{id}/send-request` creates an approval record.
+4. `POST /api/v1/approvals/{id}/approve` — only now does the worker send.
+   Ownership, the `email.send` permission, and the recipient are all
+   re-checked immediately before sending, and the send is idempotent.
+
+## No demo data, no offline mode
+
+There is no seeded inbox, no in-memory outbox, and no hardcoded fallback app
+list. If Composio is unconfigured or you have not connected an app, the server
+says so (`409` on a sync/send attempt, an empty catalog) instead of inventing
+messages. Tests inject a Composio double via `composio_client.set_client_factory`
+rather than relying on a demo path in production code.
+
+## Try it with curl
 
 ```bash
-NEBIUS_API_KEY=... NEBIUS_MODEL=... PA_FAKE_MODEL=0 docker compose up -d
-```
+BASE=http://127.0.0.1:8000
 
-Check status with `docker compose ps` and stop with `docker compose down`.
-API logs: `docker compose logs api`. Frontend logs: `docker compose logs ui`.
+# Public: what can I connect?
+curl -s $BASE/api/v1/apps
 
-Docs: `http://127.0.0.1:8000/docs` — Liveness: `GET /health`, Readiness: `GET /ready` (DB + Redis checks).
-
-## API docs (Swagger)
-
-FastAPI serves interactive docs automatically — no extra setup:
-
-- Swagger UI: `http://127.0.0.1:8000/docs` (try every endpoint in the browser)
-- ReDoc: `http://127.0.0.1:8000/redoc`
-- Raw OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`
-
-Every endpoint is tagged (`assistant`, `jobs`, `approvals`, `memory`, `ops`)
-with summaries and response schemas. In Swagger UI, set the `X-User-Id`
-header (default `demo-user`) via any endpoint's Headers section to act as
-that user.
-
-## Gradio frontend
-
-Tabs for chat, jobs, approvals, memory, daily briefing, and health. Runs
-in-process against the same SQLite DB, so no Redis needed for a local demo
-(it falls back to eager execution when no worker is available):
-
-```bash
-PA_FAKE_MODEL=1 .venv/bin/python -m pa.frontend
-# → http://127.0.0.1:7860
-```
-
-To serve the UI mounted inside the API at `/ui`:
-
-```bash
-PA_ENABLE_UI=1 uvicorn pa.app:app --app-dir src
-# → http://127.0.0.1:8000/ui
-```
-
-## Demo (no Redis/provider needed)
-
-```bash
-.venv/bin/python -m pa.seed --user demo-user
-PA_FAKE_MODEL=1 .venv/bin/python scripts/demo_e2e.py
-```
-
-Covers §20: submit→202, queued→completed, audit trail, memory persistence,
-approval pause/resume, transient vs permanent errors, 403 + duplicate safety,
-seeded briefing.
-
-## Connected apps (Gmail, WhatsApp, Zoom)
-
-Connect everyday apps so the assistant can do human-assistance jobs —
-triage the inbox, send messages, schedule meetings. Status and read-only
-views live under `GET /api/v1/integrations`; **sends only execute through
-approval-gated workflows** (there is no direct send endpoint).
-
-```bash
-# See what's connected (mock vs live — never exposes secrets)
-curl http://127.0.0.1:8000/api/v1/integrations
-
-# Read-only views
-curl "http://127.0.0.1:8000/api/v1/integrations/gmail/inbox?limit=5"
-curl http://127.0.0.1:8000/api/v1/integrations/zoom/meetings
-```
-
-Without credentials every provider runs in **mock mode** (seeded inbox,
-chats, meetings; sends recorded in-memory). For live mode set the matching
-vars in `.env` (see `.env.example`): Gmail needs `GMAIL_ADDRESS` plus an
-app password; WhatsApp needs Twilio `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN`
-/ `TWILIO_WHATSAPP_FROM`; Zoom needs Server-to-Server OAuth
-`ZOOM_ACCOUNT_ID` / `ZOOM_CLIENT_ID` / `ZOOM_CLIENT_SECRET`.
-
-Example jobs (pause for approval, then execute on approve):
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/v1/assistant/tasks \
-  -H 'Content-Type: application/json' -H 'X-User-Id: demo-user' \
-  -d '{"request":"Send an email to bob@example.com about lunch tomorrow"}'
-
-curl -X POST http://127.0.0.1:8000/api/v1/assistant/tasks \
-  -H 'Content-Type: application/json' -H 'X-User-Id: demo-user' \
-  -d '{"request":"Schedule a Zoom meeting for sprint planning"}'
-```
-
-## Operations
-```bash
-# Seed demo tasks/notes/preferences (idempotent)
-.venv/bin/python -m pa.seed --user demo-user
-
-# Inspect stale jobs (queued/running with no recent update)
-.venv/bin/python -m pa.recover --stale-minutes 30
-
-# Safely requeue stale jobs (dry-run first)
-.venv/bin/python -m pa.recover --stale-minutes 30 --requeue --dry-run
-.venv/bin/python -m pa.recover --stale-minutes 30 --requeue
-
-# Queue depth + DB status counts (monitoring)
-.venv/bin/python -m pa.recover --queue-depth
-```
-
-Structured logs carry `correlation_id/job_id/thread_id` (`X-Correlation-Id`
-header echoed); secrets are redacted. See `instructions.md` for full MVP spec,
-architecture, and definition of done.
-
-## Agent skills
-
-`skills/` holds one `SKILL.md` per agent workflow (frontmatter `name` +
-`description` for discovery, then operating instructions):
-
-- `assistant-request` — submit a task, poll it to completion
-- `daily-briefing` — briefing from seeded tasks/notes/preferences
-- `approval-gated-action` — propose, pause, approve/reject, resume
-- `persistent-memory` — scoped save/list/delete of preferences
-- `job-recovery` — stale-job inspection and safe requeue
-
-Validated by `tests/unit/test_skills.py`.
-
-Submit a task (returns `202` + `job_id` immediately):
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/v1/assistant/tasks \
+TOKEN=$(curl -s -X POST $BASE/api/v1/auth/signup \
   -H 'Content-Type: application/json' \
-  -H 'X-User-Id: demo-user' \
-  -d '{"request":"Prepare a concise morning briefing"}'
+  -d '{"email":"me@example.com","password":"Str0ngPass123"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+AUTH="Authorization: Bearer $TOKEN"
+
+# Connect an app (returns the URL to authorise)
+curl -s -X POST $BASE/api/v1/integrations/gmail/connect -H "$AUTH"
+curl -s $BASE/api/v1/integrations/gmail/status -H "$AUTH"
+
+# Triage, draft, approve
+curl -s -X POST $BASE/api/v1/email/sync -H "$AUTH"
+curl -s $BASE/api/v1/email/messages -H "$AUTH"
+curl -s $BASE/api/v1/observability/costs -H "$AUTH"
+curl -s $BASE/api/v1/evals/classification -H "$AUTH"
 ```
 
-Check status:
+## Tests
 
 ```bash
-curl http://127.0.0.1:8000/api/v1/jobs/<job_id> -H 'X-User-Id: demo-user'
+pytest                                  # backend
+cd web && npm run typecheck && npm run build
 ```
 
-For deterministic local runs without live inference:
+## Security notes
 
-```bash
-PA_FAKE_MODEL=1 pytest
-```
-
-See `instructions.md` for full MVP spec, architecture, and definition of done.
+- Passwords use `hashlib.scrypt`; sessions are opaque tokens stored only as
+  SHA-256 hashes, so a database leak cannot be replayed.
+- Every user-owned table has an explicit `user_id` and every query filters on
+  it — there is no cross-user read path.
+- Permissions (`email.read`, `email.send`, `email.proactive`, `email.auto_send`)
+  are deny-by-default; `email.auto_send` starts off.
+- Email bodies are treated as untrusted data and never as instructions.
+- Before exposing publicly: HTTPS, secure cookie flags, rate limiting,
+  and secret management.

@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,9 +13,12 @@ _test_checkpoints = os.path.join(_tmpdir, "checkpoints.db")
 
 os.environ["DATABASE_URL"] = f"sqlite:///{_test_db}"
 os.environ["LANGGRAPH_CHECKPOINT_DB"] = _test_checkpoints
-os.environ["PA_FAKE_MODEL"] = "1"
 os.environ["NEBIUS_API_KEY"] = "test-key"
 os.environ["NEBIUS_MODEL"] = "test-model"
+os.environ["COMPOSIO_API_KEY"] = "test-composio-key"
+# Tests use throwaway SQLite files and create tables directly (fast); the app
+# itself always uses Alembic.
+os.environ["PA_SKIP_MIGRATIONS"] = "1"
 
 from pa.config import reset_settings_cache
 from pa.db.database import init_db, reset_engine
@@ -79,3 +83,123 @@ def _clean_model_override():
     q_tasks.clear_model_override()
     yield
     q_tasks.clear_model_override()
+
+
+# --- Composio test double -------------------------------------------------
+#
+# Production code has no offline/demo transport: it always talks to Composio.
+# Tests inject a stand-in for the SDK through the existing DI hook
+# (composio_client.set_client_factory) so the real code paths run unmodified.
+
+FAKE_INBOX = [
+    {
+        "id": "msg-1",
+        "threadId": "thread-1",
+        "from": "billing@acme-supplies.example",
+        "subject": "URGENT: Invoice #1042 is overdue",
+        "snippet": "Your invoice is 14 days overdue. Please pay immediately to avoid service suspension.",
+        "body": "Your invoice #1042 ($4,280) is 14 days overdue. Please pay by Friday, Nov 14 to avoid suspension.",
+    },
+    {
+        "id": "msg-2",
+        "threadId": "thread-2",
+        "from": "sam@team.example",
+        "subject": "Re: Q3 planning deck",
+        "snippet": "Can you send me the updated deck by Thursday, Dec 3? Let me know when you can.",
+        "body": "Can you send me the updated Q3 deck by Thursday, Dec 3? Let me know if Thursday works.",
+    },
+    {
+        "id": "msg-3",
+        "threadId": "thread-3",
+        "from": "digest@industry.example",
+        "subject": "Weekly newsletter: 12 things trending",
+        "snippet": "This week in tech. Unsubscribe anytime with one click.",
+        "body": "Top stories this week in tech and markets. Unsubscribe anytime.",
+    },
+]
+
+
+class _FakeToolkits:
+    def list(self, **_kwargs):
+        # The SDK returns objects, not dicts; production reads .items off them.
+        return SimpleNamespace(
+            items=[
+                {"slug": "gmail", "meta": {"display_name": "Gmail", "description": "Email."}},
+                {"slug": "slack", "meta": {"display_name": "Slack", "description": "Messaging."}},
+            ]
+        )
+
+
+class _FakeConnectedAccounts:
+    def __init__(self, owner):
+        self._owner = owner
+        self.revoked: list[str] = []
+
+    def list(self, **_kwargs):
+        if not self._owner.connected:
+            return SimpleNamespace(items=[])
+        return SimpleNamespace(
+            items=[{"id": "ca-1", "status": "ACTIVE", "toolkit": {"slug": "gmail"}}]
+        )
+
+    def revoke(self, connected_account_id):
+        self.revoked.append(connected_account_id)
+        self._owner.connected = False
+
+
+class _FakeTools:
+    def __init__(self, owner):
+        self._owner = owner
+
+    def execute(self, *, tool_slug, arguments, connected_account_id):
+        if not self._owner.connected:
+            raise RuntimeError("connected account is not active")
+        if tool_slug.endswith("FETCH_EMAILS"):
+            return {"messages": list(self._owner.inbox)}
+        if tool_slug.endswith("SEND_EMAIL"):
+            self._owner.sent.append(
+                {"account": connected_account_id, **arguments, "thread_id": arguments.get("thread_id", "")}
+            )
+            return {"id": f"sent-{len(self._owner.sent)}"}
+        return {}
+
+
+class _FakeAuthConfigs:
+    def list(self, **_kwargs):
+        return SimpleNamespace(items=[{"id": "authcfg-1"}])
+
+
+class _FakeLink:
+    def create(self, **_kwargs):
+        return SimpleNamespace(redirect_url="https://composio.test/oauth/authorize")
+
+
+class _FakeSDK:
+    def __init__(self, owner):
+        self.toolkits = _FakeToolkits()
+        self.connected_accounts = _FakeConnectedAccounts(owner)
+        self.tools = _FakeTools(owner)
+        self.auth_configs = _FakeAuthConfigs()
+        self.link = _FakeLink()
+
+
+class FakeComposio:
+    """Stand-in for the Composio SDK client."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+        self.inbox = [dict(m) for m in FAKE_INBOX]
+        self.connected = True
+        self.client = _FakeSDK(self)
+
+
+@pytest.fixture(autouse=True)
+def fake_composio():
+    from pa.integrations import composio_client
+
+    fake = FakeComposio()
+    composio_client.set_client_factory(lambda: fake)
+    try:
+        yield fake
+    finally:
+        composio_client.clear_client_factory()

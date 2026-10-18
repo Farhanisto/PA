@@ -1,13 +1,42 @@
-"""GET /api/v1/jobs/{job_id} — durable job status/result with ownership check."""
+"""GET /api/v1/jobs — durable job status/result with ownership check."""
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from pa.api.dependencies import get_current_user_id, get_db
+from pa.api.dependencies import get_current_user, get_db
 from pa.db import repositories
 from pa.schemas.assistant import JobResponse
 
 router = APIRouter()
+
+
+@router.get(
+    "/jobs",
+    response_model=list[JobResponse],
+    summary="List my jobs",
+    description="Newest first, scoped to the caller. Used by dashboards for recent-job views.",
+)
+def list_jobs(
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    """List the caller's recent jobs, newest first."""
+    jobs = repositories.list_jobs_for_user(db, user_id=user_id, limit=limit)
+    return [
+        JobResponse(
+            job_id=j.id,
+            thread_id=j.thread_id,
+            status=j.status,
+            request=j.request,
+            result=j.result,
+            error_code=j.error_code,
+            created_at=j.created_at,
+            started_at=j.started_at,
+            finished_at=j.finished_at,
+        )
+        for j in jobs
+    ]
 
 
 @router.get(
@@ -21,7 +50,7 @@ router = APIRouter()
     ),
 )
 def get_job_status(
-    job_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)
+    job_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user)
 ):
     """Poll a previously submitted job for its status/result."""
     job = repositories.get_job(db, job_id)
@@ -36,4 +65,7 @@ def get_job_status(
         request=job.request,
         result=job.result,
         error_code=job.error_code,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
     )

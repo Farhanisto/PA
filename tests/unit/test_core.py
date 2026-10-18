@@ -30,6 +30,55 @@ def test_model_adapter_success(monkeypatch):
     assert model is not None
 
 
+def test_groq_missing_key_raises(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    from pa.models.groq import create_groq_model
+
+    with pytest.raises(RuntimeError, match="GROQ_API_KEY"):
+        create_groq_model()
+
+
+def test_groq_adapter_defaults(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    from pa.models.groq import create_groq_model
+
+    model = create_groq_model()
+    assert model.model_name == "openai/gpt-oss-120b"
+    assert "groq" in str(model.openai_api_base)
+
+
+def test_factory_uses_groq_when_key_set(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    monkeypatch.setenv("NEBIUS_API_KEY", "k2")
+    monkeypatch.setenv("NEBIUS_MODEL", "m2")
+    from pa.models.factory import create_model, resolve_provider
+
+    assert resolve_provider() == "groq"
+    model = create_model()
+    assert "groq" in str(model.openai_api_base)
+
+
+def test_factory_falls_back_to_nebius(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("NEBIUS_API_KEY", "k")
+    monkeypatch.setenv("NEBIUS_MODEL", "m")
+    from pa.models.factory import create_model, resolve_provider
+
+    assert resolve_provider() == "nebius"
+    assert create_model() is not None
+
+
+def test_factory_no_keys_raises_nebius_error(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("NEBIUS_API_KEY", raising=False)
+    monkeypatch.delenv("NEBIUS_MODEL", raising=False)
+    from pa.models.factory import create_model
+
+    with pytest.raises(RuntimeError, match="NEBIUS_API_KEY"):
+        create_model()
+
+
 def test_graph_routes_to_expected_nodes(fake_model):
     from pa.graph.builder import build_graph
 
@@ -68,8 +117,8 @@ def test_policy_denies_unauthorized_tools():
     from pa.security.policy import is_action_allowed
 
     assert not is_action_allowed(tool_name="rm_rf", user_id="u", args={})
-    assert not is_action_allowed(tool_name="generate_briefing", user_id="", args={})
-    assert is_action_allowed(tool_name="generate_briefing", user_id="u", args={"tasks": ["a"]})
+    assert not is_action_allowed(tool_name="compose_email", user_id="", args={})
+    assert is_action_allowed(tool_name="compose_email", user_id="u", args={"to": "a@b.co"})
 
 
 def test_invalid_tool_args_rejected():
@@ -77,8 +126,8 @@ def test_invalid_tool_args_rejected():
 
     with pytest.raises(ValueError, match="not allowed"):
         invoke_tool("nonexistent_tool", {})
-    with pytest.raises(ValueError):
-        invoke_tool("generate_briefing", {"tasks": "not-a-list"})
+    with pytest.raises(ValueError, match="recipient"):
+        invoke_tool("compose_email", {"to": "not-an-email", "body": "hi"})
 
 
 def test_memory_scoped_and_deletable(db_session):
@@ -109,8 +158,70 @@ def test_retry_policy_distinguishes():
     assert not is_transient_error(PermissionError("not authorized"))
 
 
-def test_briefing_tool_builds():
-    from pa.tools.briefing import build_briefing
+def test_sending_tools_require_approval():
+    from pa.security.policy import requires_approval
 
-    out = build_briefing(tasks=["Ship MVP"], notes=["note"], preferences=["concise"])
-    assert "Ship MVP" in out and "concise" in out
+    assert requires_approval("email_send_draft")
+
+
+# --- Composio toolkit slugs: any catalog toolkit is connectable ---
+
+
+def test_any_catalog_toolkit_slug_is_accepted():
+    """No fixed whitelist: Composio serves many toolkits, all must work."""
+    from pa.integrations.composio_client import toolkit_slug
+
+    for name in [
+        "gmail",
+        "notion",
+        "slack",
+        "github",
+        "googlecalendar",
+        "outlook",
+        "hubspot",
+        "airtable",
+        "apollo",
+        "zendesk",
+        "salesforce",
+        "microsoft_teams",
+        "some-brand-new-toolkit",
+    ]:
+        assert toolkit_slug(name) == name.replace("_", "-").lower()
+
+
+def test_toolkit_slug_normalises_input():
+    from pa.integrations.composio_client import toolkit_slug
+
+    assert toolkit_slug("  Gmail  ") == "gmail"
+    assert toolkit_slug("Microsoft_Teams") == "microsoft-teams"
+    assert toolkit_slug("google calendar") == "google-calendar"
+
+
+def test_toolkit_slug_rejects_junk():
+    from pa.integrations.composio_client import toolkit_slug
+
+    for bad in ["", "   ", "../etc/passwd", "toolkit;drop", "a" * 200]:
+        with pytest.raises(ValueError):
+            toolkit_slug(bad)
+
+
+@pytest.mark.parametrize("provider", ["gmail", "notion", "slack", "github", "zendesk"])
+def test_connect_works_for_any_toolkit(provider, fake_composio):
+    """Previously only gmail/whatsapp/zoom worked; now any catalog slug does."""
+    from pa.integrations import composio_client as cc
+
+    out = cc.initiate_connection("u1", provider)
+    assert out["provider"] == provider
+    assert out["redirect_url"].startswith("https://")
+
+
+def test_connect_reports_missing_auth_config_clearly(fake_composio):
+    """With no auth config available the error must say so, not 'unknown provider'."""
+    from pa.integrations import composio_client as cc
+
+    fake_composio.client.auth_configs.list = lambda **_k: type("R", (), {"items": []})()
+    with pytest.raises(ValueError) as exc:
+        cc.initiate_connection("u1", "notion")
+    msg = str(exc.value)
+    assert "unknown provider" not in msg
+    assert "auth config" in msg

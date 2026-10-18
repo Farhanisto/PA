@@ -73,9 +73,9 @@ def _resolve_model(config: RunnableConfig | None = None):
         model = config["configurable"].get("model")
         if model is not None:
             return model
-    from pa.models.nebius import create_nebius_model
+    from pa.models.factory import create_model
 
-    return create_nebius_model()
+    return create_model()
 
 
 def _prompt_for(state: dict) -> str:
@@ -137,16 +137,6 @@ def propose_action(state: dict, config: RunnableConfig | None = None) -> dict:
         "request": s.get("request", ""),
         "summary": (s.get("response") or "")[:1000],
     }
-    try:
-        from pa.integrations.intents import detect_integration_action
-        from pa.tools.registry import is_allowed
-
-        detected = detect_integration_action(s.get("request", ""), s.get("response", ""))
-        if detected and is_allowed(detected["tool"]):
-            proposal["tool"] = detected["tool"]
-            proposal["args"] = detected["args"]
-    except Exception:
-        pass
     return {"proposed_action": proposal, "approval_status": "pending"}
 
 

@@ -227,3 +227,10 @@ privateos.db*
 privateos_checkpoints.db*
 *.db-journal
 .dump.rdb
+
+# Next.js frontend
+web/node_modules/
+web/.next/
+web/out/
+celerybeat-schedule*
+celerybeat.pid

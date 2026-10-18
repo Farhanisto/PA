@@ -201,6 +201,17 @@ def count_jobs_by_status(db: Session) -> dict[str, int]:
     return {status: count for status, count in rows}
 
 
+def list_active_user_ids(db: Session, *, limit: int = 500) -> list[str]:
+    """Distinct user ids with jobs or memories (beat fan-out targets)."""
+    job_ids = db.scalars(select(Job.user_id).distinct().limit(limit)).all()
+    mem_ids = db.scalars(select(Memory.user_id).distinct().limit(limit)).all()
+    seen: list[str] = []
+    for uid in (*job_ids, *mem_ids):
+        if uid and uid not in seen:
+            seen.append(uid)
+    return seen[:limit]
+
+
 def list_stale_jobs(db: Session, *, stale_minutes: int = 30, limit: int = 100) -> list[Job]:
     """Jobs stuck in running/queued with no recent update (worker may have died)."""
     from datetime import timedelta
