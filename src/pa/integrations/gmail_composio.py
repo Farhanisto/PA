@@ -136,6 +136,9 @@ def fetch_inbox(user_id: str, *, max_results: int = 20, client=None) -> list[dic
             tool_slug=_tool_fetch(),
             arguments={"maxResults": max_results, "q": "in:inbox"},
             connected_account_id=account_id,
+            # Composio requires the owning user whenever a connected account is
+            # supplied; without it every execute() call fails 400.
+            user_id=composio_client.user_ref(user_id),
         )
     except Exception as exc:
         raise RuntimeError(f"Gmail fetch failed: {type(exc).__name__}: {exc}") from exc
@@ -174,6 +177,7 @@ def send_email(
             tool_slug=_tool_send(),
             arguments=payload,
             connected_account_id=account_id,
+            user_id=composio_client.user_ref(user_id),
         )
     except Exception as exc:
         raise RuntimeError(f"Gmail send failed: {type(exc).__name__}: {exc}") from exc

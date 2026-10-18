@@ -225,3 +225,218 @@ def test_connect_reports_missing_auth_config_clearly(fake_composio):
     msg = str(exc.value)
     assert "unknown provider" not in msg
     assert "auth config" in msg
+
+
+# --- Composio connection-state fan-out: one call, not one per toolkit ---
+
+
+def test_connection_states_uses_a_single_batched_call(fake_composio):
+    """60 toolkits must not mean 60 network round trips."""
+    from pa.integrations import composio_client as cc
+
+    cc.invalidate_states()
+    calls = []
+    real = fake_composio.client.connected_accounts.list
+
+    def counting(**kwargs):
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    fake_composio.client.connected_accounts.list = counting
+
+    states = cc.connection_states("u1")
+    assert len(calls) == 1, f"expected 1 batched call, made {len(calls)}"
+    # No per-toolkit filter: that was the N+1.
+    assert "toolkit_slugs" not in calls[0]
+    # The double exposes one active gmail account and nothing else.
+    assert states == {"gmail": "active"}
+
+
+def test_connection_states_are_cached_then_invalidated(fake_composio):
+    from pa.integrations import composio_client as cc
+
+    cc.invalidate_states()
+    calls = []
+    real = fake_composio.client.connected_accounts.list
+
+    def counting(**kwargs):
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    fake_composio.client.connected_accounts.list = counting
+
+    cc.connection_states("u1")
+    cc.connection_states("u1")
+    cc.connection_states("u1")
+    assert len(calls) == 1, "repeat reads should hit the cache"
+
+    # A connect must invalidate immediately, or the UI shows a stale state.
+    cc.initiate_connection("u1", "gmail")
+    cc.connection_states("u1")
+    assert len(calls) == 2, "connect must invalidate the cached states"
+
+
+def test_batched_states_map_toolkit_slugs(fake_composio):
+    """Toolkit slug and status are read correctly off the account shape."""
+    from pa.integrations import composio_client as cc
+
+    class Account:
+        def __init__(self, slug, status):
+            self.toolkit = type("T", (), {"slug": slug})()
+            self.status = status
+            self.id = f"ca-{slug}"
+
+    class Resp:
+        items = [
+            Account("gmail", "ACTIVE"),
+            Account("slack", "INITIALIZING"),
+            Account("notion", "FAILED"),
+            Account("github", "EXPIRED"),
+        ]
+
+    fake_composio.client.connected_accounts.list = lambda **k: Resp()
+    cc.invalidate_states()
+    states = cc.connection_states("u1")
+    assert states["gmail"] == "active"
+    assert states["slack"] == "pending"
+    assert states["notion"] == "pending"
+    assert states["github"] == "pending"
+
+
+def test_catalog_is_cached(fake_composio):
+    """The toolkit list is near-static; repeated calls must not re-fetch."""
+    from pa.integrations import catalog
+
+    catalog._catalog_cache["at"] = 0.0
+    catalog._catalog_cache["apps"] = None
+    calls = []
+    real = fake_composio.client.toolkits.list
+
+    def counting(**kwargs):
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    fake_composio.client.toolkits.list = counting
+
+    catalog.list_apps()
+    catalog.list_apps()
+    catalog.list_apps()
+    assert len(calls) == 1, "catalog should be served from cache"
+    # A forced refresh must bypass it.
+    catalog.list_apps(use_cache=False)
+    assert len(calls) == 2
+
+
+def test_composio_client_is_memoised(fake_composio):
+    """Composio(...) costs seconds to build; it must not be rebuilt per call."""
+    from pa.integrations import composio_client as cc
+
+    cc.reset_client()
+    built = []
+
+    class Slow:
+        def __init__(self):
+            built.append(1)
+
+    # Bypass the test factory so the real construction path is exercised.
+    cc.clear_client_factory()
+    try:
+        import composio
+
+        real = composio.Composio
+        composio.Composio = lambda **_kw: Slow()
+        try:
+            cc.get_client()
+            cc.get_client()
+            cc.get_client()
+            assert len(built) == 1, "client was rebuilt instead of reused"
+        finally:
+            composio.Composio = real
+    finally:
+        cc.reset_client()
+
+
+def test_catalog_walks_cursor_pagination(fake_composio):
+    """The catalog must not be truncated to a single Composio page."""
+    from pa.integrations import catalog
+
+    catalog._catalog_cache["at"] = 0.0
+    catalog._catalog_cache["apps"] = None
+
+    pages = [
+        type("R", (), {"items": [{"slug": f"app{i}", "name": f"App {i}"} for i in range(0, 5)],
+                       "next_cursor": "c1"})(),
+        type("R", (), {"items": [{"slug": f"app{i}", "name": f"App {i}"} for i in range(5, 9)],
+                       "next_cursor": None})(),
+    ]
+    seen_cursors = []
+
+    def fake_list(**kw):
+        seen_cursors.append(kw.get("cursor"))
+        return pages[min(len(seen_cursors) - 1, len(pages) - 1)]
+
+    fake_composio.client.toolkits.list = fake_list
+    apps = catalog.list_apps(use_cache=False)
+    assert len(apps) == 9, f"expected all pages, got {len(apps)}"
+    assert seen_cursors[0] is None
+    assert seen_cursors[1] == "c1", "second page must follow the cursor"
+
+
+def test_catalog_dedupes_across_pages(fake_composio):
+    from pa.integrations import catalog
+
+    catalog._catalog_cache["at"] = 0.0
+    catalog._catalog_cache["apps"] = None
+    pages = [
+        type("R", (), {"items": [{"slug": "gmail", "name": "Gmail"}], "next_cursor": "c1"})(),
+        type("R", (), {"items": [{"slug": "gmail", "name": "Gmail"}], "next_cursor": None})(),
+    ]
+    n = {"i": 0}
+
+    def fake_list(**_kw):
+        r = pages[min(n["i"], 1)]
+        n["i"] += 1
+        return r
+
+    fake_composio.client.toolkits.list = fake_list
+    assert len(catalog.list_apps(use_cache=False)) == 1
+
+
+def test_list_tools_returns_normalised_tools(fake_composio):
+    from pa.integrations import catalog
+
+    catalog._tool_cache.clear()
+
+    class Tool:
+        def __init__(self, slug):
+            self.slug = slug
+            self.name = slug.replace("_", " ").title()
+            self.description = "does a thing"
+
+    fake_composio.client.tools.list = lambda **k: type(
+        "R", (), {"items": [Tool("GMAIL_SEND_EMAIL"), Tool("GMAIL_FETCH_EMAILS")]}
+    )()
+    tools = catalog.list_tools("gmail")
+    assert [t["slug"] for t in tools] == ["GMAIL_SEND_EMAIL", "GMAIL_FETCH_EMAILS"]
+    assert tools[0]["description"] == "does a thing"
+
+
+def test_tool_execution_passes_the_user_ref(fake_composio):
+    """Composio 400s a connected_account_id without a user_id; verify both are sent."""
+    from pa.integrations import gmail_composio
+
+    msgs = gmail_composio.fetch_inbox("user-123")
+    assert len(msgs) == 3
+    assert fake_composio.executed, "no tool call recorded"
+    call = fake_composio.executed[-1]
+    assert call["user_id"] == "user-123"
+    assert call["account"] == "ca-1"
+    assert call["tool"] == "GMAIL_FETCH_EMAILS"
+
+
+def test_tool_execution_send_passes_the_user_ref(fake_composio):
+    from pa.integrations import gmail_composio
+
+    gmail_composio.send_email("user-123", to="a@b.com", subject="hi", body="hello")
+    call = [c for c in fake_composio.executed if c["tool"] == "GMAIL_SEND_EMAIL"][-1]
+    assert call["user_id"] == "user-123"

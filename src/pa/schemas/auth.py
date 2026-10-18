@@ -180,3 +180,19 @@ class EvalSuiteResult(BaseModel):
     failed: int
     score: float
     results: list[EvalCaseResult] = Field(default_factory=list)
+
+
+class ToolInfo(BaseModel):
+    """One Composio tool available to the agent for a connected app."""
+
+    slug: str
+    name: str
+    description: str = ""
+
+
+class ToolkitToolsResponse(BaseModel):
+    provider: str
+    connected: bool
+    state: str
+    tool_count: int
+    tools: list[ToolInfo]

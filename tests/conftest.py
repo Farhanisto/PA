@@ -151,7 +151,18 @@ class _FakeTools:
     def __init__(self, owner):
         self._owner = owner
 
-    def execute(self, *, tool_slug, arguments, connected_account_id):
+    def execute(self, *, tool_slug, arguments, connected_account_id, user_id=None):
+        # Composio rejects a connected_account_id without a user_id (400), so
+        # the double enforces the same contract.
+        if not connected_account_id:
+            raise RuntimeError("connected_account_id required")
+        if not user_id:
+            raise RuntimeError(
+                "User ID is required with connected account. Please provide a user"
+            )
+        self._owner.executed.append(
+            {"tool": tool_slug, "user_id": user_id, "account": connected_account_id}
+        )
         if not self._owner.connected:
             raise RuntimeError("connected account is not active")
         if tool_slug.endswith("FETCH_EMAILS"):
@@ -188,6 +199,7 @@ class FakeComposio:
 
     def __init__(self):
         self.sent: list[dict] = []
+        self.executed: list[dict] = []
         self.inbox = [dict(m) for m in FAKE_INBOX]
         self.connected = True
         self.client = _FakeSDK(self)

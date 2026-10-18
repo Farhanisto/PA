@@ -16,6 +16,7 @@ blueprint shared by all users) before a connection can be created.
 
 import logging
 import os
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ def set_client_factory(factory) -> None:
 def clear_client_factory() -> None:
     global _client_factory
     _client_factory = None
+    reset_client()
 
 
 def _configured_key() -> str:
@@ -52,15 +54,32 @@ def _require_key() -> str:
     return key
 
 
+_client_cache = None
+
+
+def reset_client() -> None:
+    """Drop the memoised client (config change or test teardown)."""
+    global _client_cache
+    _client_cache = None
+
+
 def get_client():
-    """Return a Composio client (fake factory wins in tests)."""
+    """Return a shared Composio client (fake factory wins in tests).
+
+    Constructing ``Composio(...)`` costs several seconds, so it is memoised:
+    the client is stateless and safe to reuse, and callers no longer pay that
+    cost on every request.
+    """
+    global _client_cache
     if _client_factory is not None:
         return _client_factory()
-    try:
-        from composio import Composio
-    except ImportError as exc:
-        raise RuntimeError("composio package is not installed") from exc
-    return Composio(api_key=_require_key())
+    if _client_cache is None:
+        try:
+            from composio import Composio
+        except ImportError as exc:
+            raise RuntimeError("composio package is not installed") from exc
+        _client_cache = Composio(api_key=_require_key())
+    return _client_cache
 
 
 def toolkit_slug(provider: str) -> str:
@@ -136,35 +155,95 @@ def initiate_connection(
     url = _pick_redirect(link)
     if not url:
         raise RuntimeError(f"Composio did not return a redirect URL for '{provider}'")
+    invalidate_states(user_id)
     logger.info("composio connect initiated: provider=%s user set", provider)
     return {"provider": provider, "redirect_url": url}
+
+
+def _state_for(status: str) -> str:
+    status = (status or "").upper()
+    if status == "ACTIVE":
+        return "active"
+    if status in {"INITIALIZING", "INITIATED", "FAILED", "EXPIRED"}:
+        return "pending"
+    return "none"
+
+
+def _item_toolkit_slug(item: Any) -> str:
+    """Pull the toolkit slug off a connected account (object or dict shape)."""
+    raw = item.get("toolkit") if isinstance(item, dict) else getattr(item, "toolkit", None)
+    if raw is None:
+        raw = item.get("toolkit_slug") if isinstance(item, dict) else getattr(item, "toolkit_slug", None)
+    if raw is None:
+        return ""
+    slug = raw.get("slug") if isinstance(raw, dict) else getattr(raw, "slug", None)
+    if not slug and isinstance(raw, str):
+        slug = raw
+    return str(slug or "").strip().lower()
+
+
+def _unwrap_items(resp: Any) -> list:
+    items = getattr(resp, "items", None) or getattr(resp, "data", None) or []
+    if isinstance(items, dict):
+        items = items.get("items", []) or items.get("data", [])
+    return list(items)
+
+
+_STATE_TTL_SECONDS = 15.0
+_state_cache: dict[str, tuple[float, dict[str, str]]] = {}
+
+
+def invalidate_states(user_id: str | None = None) -> None:
+    """Drop cached connection states (all users, or just one)."""
+    if user_id is None:
+        _state_cache.clear()
+    else:
+        _state_cache.pop(user_ref(user_id), None)
+
+
+def connection_states(user_id: str, org_id: str | None = None) -> dict[str, str]:
+    """Map toolkit slug -> state for ONE user, in a single API call.
+
+    Querying per toolkit is an N+1 against the network: with ~60 toolkits that
+    is ~60 round trips (tens of seconds). One unfiltered list is enough.
+
+    Results are cached briefly and invalidated explicitly whenever we connect
+    or revoke, so repeated page loads do not pay a round trip while a genuine
+    change is still reflected immediately.
+    """
+    if not is_configured():
+        return {}
+    ref = user_ref(user_id, org_id)
+    cached = _state_cache.get(ref)
+    if cached is not None:
+        at, states = cached
+        if (time.monotonic() - at) < _STATE_TTL_SECONDS:
+            return dict(states)
+    try:
+        client = get_client()
+        resp = client.client.connected_accounts.list(user_ids=[ref], limit=100)
+    except Exception as exc:
+        logger.warning("composio status check failed: %s", type(exc).__name__)
+        return {}
+    out: dict[str, str] = {}
+    for item in _unwrap_items(resp):
+        slug = _item_toolkit_slug(item)
+        if not slug:
+            continue
+        state = _state_for(_norm_status(item))
+        # An active account wins over a stale pending/failed one.
+        if out.get(slug) != "active":
+            out[slug] = state
+    _state_cache[ref] = (time.monotonic(), dict(out))
+    return out
 
 
 def connection_state(user_id: str, provider: str, client=None, org_id: str | None = None) -> str:
     """'active' | 'pending' | 'none' | 'unavailable' (never raises on API errors)."""
     slug = toolkit_slug(provider)
-    ref = user_ref(user_id, org_id)
     if not is_configured():
         return "unavailable"
-    try:
-        client = client or get_client()
-        resp = client.client.connected_accounts.list(
-            user_ids=[ref], toolkit_slugs=[slug], limit=10
-        )
-    except Exception as exc:
-        logger.warning("composio status check failed: %s", type(exc).__name__)
-        return "unavailable"
-    items = getattr(resp, "items", None) or getattr(resp, "data", None) or []
-    if isinstance(items, dict):
-        items = items.get("items", []) or items.get("data", [])
-    states = {_norm_status(i) for i in items}
-    if "ACTIVE" in states:
-        return "active"
-    if states & {"INITIALIZING", "INITIATED"}:
-        return "pending"
-    if "FAILED" in states or "EXPIRED" in states:
-        return "pending"
-    return "none"
+    return connection_states(user_id, org_id=org_id).get(slug, "none")
 
 
 def revoke_connection(user_id: str, provider: str, client=None, org_id: str | None = None) -> bool:

@@ -25,7 +25,12 @@ from composio_client import (
 from pa.db import repositories
 from pa.integrations import catalog as catalog_mod
 from pa.integrations import composio_client
-from pa.schemas.auth import AppResponse, ConnectionResponse
+from pa.schemas.auth import (
+    AppResponse,
+    ConnectionResponse,
+    ToolInfo,
+    ToolkitToolsResponse,
+)
 
 router = APIRouter(tags=["integrations"])
 
@@ -154,6 +159,38 @@ def connect(
         details={"provider": provider, "org_id": org_id or ""},
     )
     return {"provider": provider, "redirect_url": out["redirect_url"]}
+
+
+@router.get(
+    "/integrations/{provider}/tools",
+    response_model=ToolkitToolsResponse,
+    summary="Tools available for an app",
+    description=(
+        "The Composio tools the agent may call for this toolkit. Requires an "
+        "approved connection: `connected` reflects whether it is usable."
+    ),
+)
+def toolkit_tools(
+    provider: str,
+    limit: int = Query(default=200, ge=1, le=500),
+    user_id: str = Depends(get_current_user),
+):
+    """List the callable tools for one of the caller's connected apps."""
+    slug = composio_client.toolkit_slug(provider)
+    state = composio_client.connection_state(user_id, slug)
+    try:
+        tools = catalog_mod.list_tools(slug, limit=limit)
+    except Exception as exc:
+        raise _composio_http_error(exc) if isinstance(exc, ComposioError) else HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not list tools: {exc}"
+        )
+    return ToolkitToolsResponse(
+        provider=slug,
+        connected=state == "active",
+        state=state,
+        tool_count=len(tools),
+        tools=[ToolInfo(**t) for t in tools],
+    )
 
 
 @router.get(

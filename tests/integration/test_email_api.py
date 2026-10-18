@@ -407,3 +407,58 @@ def test_composio_auth_error_is_actionable_not_500(strict_client, fake_composio)
     r = c.post("/api/v1/integrations/gmail/connect", headers=hdr)
     assert r.status_code == 502
     assert "rejected" in r.json()["detail"].lower()
+
+
+def test_tools_endpoint_lists_toolkit_tools(strict_client, fake_composio):
+    from pa.integrations import catalog as catalog_mod
+
+    catalog_mod._tool_cache.clear()
+    c = strict_client
+    hdr, _ = _signup(c)
+
+    class Tool:
+        slug = "GMAIL_SEND_EMAIL"
+        name = "Gmail Send Email"
+        description = "Sends mail"
+
+    fake_composio.client.tools.list = lambda **k: type("R", (), {"items": [Tool()]})()
+
+    r = c.get("/api/v1/integrations/gmail/tools", headers=hdr)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["provider"] == "gmail"
+    assert body["tool_count"] == 1
+    assert body["tools"][0]["slug"] == "GMAIL_SEND_EMAIL"
+    assert body["connected"] is True
+
+
+def test_every_enqueued_task_name_exists_in_the_registry():
+    """Guards the stuck-queue bug: the route enqueued a task that was never defined."""
+    import ast
+    import pathlib as _pl
+
+    import pa.queue.tasks as tasks_mod
+
+    registered = set(tasks_mod.celery_app.tasks)
+    src = _pl.Path(tasks_mod.__file__).read_text()
+
+    # Every `X.delay(...)` in the API must name a task that actually exists.
+    routes_dir = _pl.Path(tasks_mod.__file__).parents[1] / "api" / "routes"
+    route_files = sorted(routes_dir.glob("*.py"))
+    assert route_files, f"no route modules found under {routes_dir}"
+    for route in route_files:
+        text = route.read_text()
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr != "delay":
+                    continue
+                name = getattr(node.func.value, "id", None)
+                if not name:
+                    continue
+                assert f"def {name}(" in src, (
+                    f"{route.name} enqueues '{name}' which is not defined in tasks.py"
+                )
+
+    # And the registry agrees with the decorators.
+    for required in ("pa.run_inbox_briefing", "pa.run_assistant_job", "pa.resume_approved_workflow"):
+        assert required in registered, f"{required} missing from the Celery registry"

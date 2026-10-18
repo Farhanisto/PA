@@ -627,3 +627,34 @@ table.table tbody tr:hover { background: var(--surface-2); }
   white-space: nowrap;
   border: 0;
 }
+
+/* ---------- Toolkit tools drawer ---------- */
+
+.tool-drawer {
+  margin-top: var(--sp-5);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border);
+}
+
+.tool-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--sp-3);
+  margin-top: var(--sp-3);
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.tool-row {
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  padding: var(--sp-2) var(--sp-3);
+}
+
+.tool-name {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}

@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { ApiError, appApi, type App } from "@/lib/api";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ApiError, appApi, type App, type ToolkitTools } from "@/lib/api";
 import { Badge, Card, EmptyState, ErrorBox, Notice, Skeleton } from "./ui";
 
 interface CatalogStatus {
@@ -23,6 +23,10 @@ export function AppsPanel({ onNeedAuth }: { onNeedAuth: () => void }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [pending, setPending] = useState<{ app: App; url: string } | null>(null);
+  const [search, setSearch] = useState("");
+  const [toolsFor, setToolsFor] = useState<string | null>(null);
+  const [tools, setTools] = useState<Record<string, ToolkitTools>>({});
+  const [toolsBusy, setToolsBusy] = useState<string | null>(null);
 
   const [status, setStatus] = useState<CatalogStatus | null>(null);
 
@@ -79,6 +83,25 @@ export function AppsPanel({ onNeedAuth }: { onNeedAuth: () => void }) {
     }
   }
 
+  async function toggleTools(app: App) {
+    if (toolsFor === app.slug) {
+      setToolsFor(null);
+      return;
+    }
+    setToolsFor(app.slug);
+    setToolsBusy(app.slug);
+    setError("");
+    try {
+      const res = await appApi.tools(app.slug);
+      setTools((prev) => ({ ...prev, [app.slug]: res }));
+    } catch (e) {
+      setError(err(e));
+      setToolsFor(null);
+    } finally {
+      setToolsBusy(null);
+    }
+  }
+
   async function disconnect(app: App) {
     setBusy(app.slug);
     setError("");
@@ -93,6 +116,18 @@ export function AppsPanel({ onNeedAuth }: { onNeedAuth: () => void }) {
   }
 
   const connected = apps?.filter((a) => a.state === "active").length ?? 0;
+
+  const filtered = useMemo(() => {
+    if (!apps) return [];
+    const q = search.trim().toLowerCase();
+    if (!q) return apps;
+    return apps.filter(
+      (a) =>
+        a.name.toLowerCase().includes(q) ||
+        a.slug.toLowerCase().includes(q) ||
+        a.description.toLowerCase().includes(q)
+    );
+  }, [apps, search]);
 
   return (
     <Card
@@ -144,7 +179,27 @@ export function AppsPanel({ onNeedAuth }: { onNeedAuth: () => void }) {
         </Notice>
       ) : null}
 
+      {apps && apps.length > 8 ? (
+        <div className="field" style={{ marginBottom: 16, maxWidth: 420 }}>
+          <label htmlFor="app-search">Search apps</label>
+          <input
+            id="app-search"
+            type="search"
+            placeholder="Search 1000+ apps…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <span className="help">
+            {filtered.length} of {apps.length} apps
+          </span>
+        </div>
+      ) : null}
+
       {loading && !apps ? <Skeleton rows={4} /> : null}
+      {apps && apps.length > 0 && filtered.length === 0 ? (
+        <EmptyState title="No apps match" hint={`Nothing found for "${search}".`} />
+      ) : null}
+
       {apps && apps.length === 0 ? (
         status && status.configured && !status.reachable ? (
           <div className="alert alert-error" role="alert">
@@ -168,9 +223,9 @@ export function AppsPanel({ onNeedAuth }: { onNeedAuth: () => void }) {
         )
       ) : null}
 
-      {apps && apps.length > 0 ? (
+      {filtered.length > 0 ? (
         <div className="grid grid-apps">
-          {apps.map((a) => (
+          {filtered.map((a) => (
             <article key={a.slug} className="app-card">
               <div className="app-card-head">
                 <div className="app-logo" aria-hidden="true">
@@ -183,6 +238,14 @@ export function AppsPanel({ onNeedAuth }: { onNeedAuth: () => void }) {
               </div>
               <p className="app-desc">{a.description}</p>
               <div className="row row-top">
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => void toggleTools(a)}
+                  aria-expanded={toolsFor === a.slug}
+                >
+                  {toolsFor === a.slug ? "Hide tools" : "Tools"}
+                </button>
                 {a.state === "active" ? (
                   <button
                     type="button"
@@ -205,6 +268,31 @@ export function AppsPanel({ onNeedAuth }: { onNeedAuth: () => void }) {
               </div>
             </article>
           ))}
+        </div>
+      ) : null}
+
+      {toolsFor ? (
+        <div className="tool-drawer">
+          {toolsBusy === toolsFor ? (
+            <Skeleton rows={3} />
+          ) : tools[toolsFor] ? (
+            <>
+              <p className="small muted">
+                {tools[toolsFor].tool_count} tools for {toolsFor}
+                {tools[toolsFor].connected ? "" : " · connect the app to let the agent use them"}
+              </p>
+              <div className="tool-list">
+                {tools[toolsFor].tools.map((tool) => (
+                  <div key={tool.slug} className="tool-row">
+                    <div className="tool-name mono">{tool.slug}</div>
+                    {tool.description ? (
+                      <div className="small muted">{tool.description}</div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : null}
         </div>
       ) : null}
     </Card>
