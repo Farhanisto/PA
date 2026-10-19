@@ -192,6 +192,10 @@ export interface Artifact {
   fields: ArtifactField[];
   badges: ArtifactBadge[];
   meta: string;
+  /** Section heading, e.g. "Needs your reply". */
+  group: string;
+  /** The id the app knows this record by. */
+  record_id: string;
   actions: ArtifactAction[];
 }
 
@@ -385,6 +389,15 @@ export const assistantApi = {
     }),
 };
 
+/** A page of cards, with enough context to fetch the next one. */
+export interface ArtifactPage {
+  items: Artifact[];
+  total: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
+}
+
 export const jobApi = {
   submit: (request: string, conversationId = "", focus?: AssistantFocus | null) =>
     req<AssistantJobAccepted>("/api/v1/assistant/tasks", {
@@ -397,8 +410,28 @@ export const jobApi = {
     }),
   list: (limit = 20) => req<Job[]>(`/api/v1/jobs?limit=${limit}`),
   get: (id: string) => req<Job>(`/api/v1/jobs/${encodeURIComponent(id)}`),
-  /** Structured app records a run surfaced, rendered as cards in the chat. */
-  artifacts: (id: string) => req<Artifact[]>(`/api/v1/jobs/${encodeURIComponent(id)}/artifacts`),
+  /**
+   * Structured app records a run surfaced, rendered as cards in the chat.
+   *
+   * The endpoint returns a page envelope when `limit` is given and a bare
+   * list otherwise, so this tolerates both — the API and the web are
+   * deployed separately, and neither order should break the cards.
+   */
+  artifacts: async (id: string, offset = 0, limit = 12): Promise<ArtifactPage> => {
+    const res = await req<ArtifactPage | Artifact[]>(
+      `/api/v1/jobs/${encodeURIComponent(id)}/artifacts?offset=${offset}&limit=${limit}`
+    );
+    if (Array.isArray(res)) {
+      return {
+        items: res,
+        total: res.length,
+        offset,
+        limit: res.length,
+        has_more: false,
+      };
+    }
+    return res;
+  },
 };
 
 export const appApi = {

@@ -26,6 +26,12 @@ def account(client):
     return {"Cookie": f"pa_session={r.json()['access_token']}"}
 
 
+def job_id_of(client, account) -> str:
+    """A job id belonging to the account."""
+    r = client.post("/api/v1/assistant/tasks", json={"request": "hi"}, headers=account)
+    return r.json()["job_id"]
+
+
 class _Msg:
     def __init__(self, content):
         self.content = content
@@ -78,9 +84,9 @@ def test_read_tool_records_become_artifacts(client, account):
             db.close()
 
         # The records are served as structured cards, not just prose.
-        r = client.get(f"/api/v1/jobs/{job_id}/artifacts", headers=account)
+        r = client.get(f"/api/v1/jobs/{job_id}/artifacts?limit=50", headers=account)
         assert r.status_code == 200, r.text
-        cards = r.json()
+        cards = r.json()["items"]
         assert len(cards) == 3, cards
         assert cards[0]["kind"] == "message"
         assert cards[0]["title"] == "URGENT: Invoice #1042 is overdue"
@@ -112,9 +118,12 @@ def test_artifacts_endpoint_is_empty_when_nothing_was_surfaced(client, account):
     )
     job_id = r.json()["job_id"]
 
-    r = client.get(f"/api/v1/jobs/{job_id}/artifacts", headers=account)
+    r = client.get(f"/api/v1/jobs/{job_id}/artifacts?limit=12", headers=account)
     assert r.status_code == 200, r.text
-    assert r.json() == []
+    page = r.json()
+    assert page["items"] == []
+    assert page["total"] == 0
+    assert page["has_more"] is False
 
 
 def test_artifacts_endpoint_404s_for_an_unknown_job(client, account):
@@ -153,3 +162,86 @@ def test_corrupt_artifact_json_reads_as_empty():
 
     job = Job(id="x", user_id="u", thread_id="t", artifacts="not json")
     assert repositories.job_artifacts(job) == []
+
+
+def test_artifacts_are_paged(client, account):
+    """A briefing can surface far more cards than fit on one screen."""
+    from pa.db import repositories
+    from pa.db.database import get_session_factory
+
+    me = client.get("/api/v1/auth/me", headers=account).json()["id"]
+    db = get_session_factory()()
+    try:
+        job = repositories.create_job(db, user_id=me, request="r")
+        cards = [
+            {
+                "id": f"hubspot:ticket:{i}",
+                "app": "hubspot",
+                "kind": "ticket",
+                "type": "Ticket",
+                "title": f"Ticket {i}",
+                "subtitle": "",
+                "body": "",
+                "fields": [],
+                "badges": [],
+                "meta": "",
+                "group": "Tickets",
+                "record_id": str(i),
+                "actions": [],
+            }
+            for i in range(25)
+        ]
+        repositories.update_job(db, job, status="completed", artifacts=cards)
+        job_id = job.id
+    finally:
+        db.close()
+
+    r = client.get(f"/api/v1/jobs/{job_id}/artifacts?limit=12", headers=account)
+    assert r.status_code == 200, r.text
+    page = r.json()
+    assert page["total"] == 25
+    assert len(page["items"]) == 12
+    assert page["has_more"] is True
+
+    r = client.get(f"/api/v1/jobs/{job_id}/artifacts?offset=12&limit=12", headers=account)
+    page2 = r.json()
+    assert page2["total"] == 25
+    assert len(page2["items"]) == 12
+    assert page2["offset"] == 12
+    assert page2["items"][0]["title"] == "Ticket 12"
+
+    r = client.get(f"/api/v1/jobs/{job_id}/artifacts?offset=24&limit=12", headers=account)
+    page3 = r.json()
+    assert len(page3["items"]) == 1
+    assert page3["has_more"] is False
+
+
+def test_a_job_with_no_records_returns_an_empty_page(client, account):
+    r = client.post("/api/v1/assistant/tasks", json={"request": "hello"}, headers=account)
+    job_id = r.json()["job_id"]
+    r = client.get(f"/api/v1/jobs/{job_id}/artifacts?limit=12", headers=account)
+    page = r.json()
+    assert page["items"] == []
+    assert page["total"] == 0
+    assert page["has_more"] is False
+
+
+def test_the_bare_list_contract_still_works(client, account):
+    """An older client sends no limit and must still get a list.
+
+    The API and the web are deployed separately, so the response shape
+    cannot simply change under the frontend.
+    """
+    r = client.get(f"/api/v1/jobs/{job_id_of(client, account)}/artifacts", headers=account)
+    assert r.status_code == 200, r.text
+    assert isinstance(r.json(), list)
+
+
+def test_asking_for_a_page_returns_the_envelope(client, account):
+    r = client.get(
+        f"/api/v1/jobs/{job_id_of(client, account)}/artifacts?offset=0&limit=5",
+        headers=account,
+    )
+    assert r.status_code == 200, r.text
+    page = r.json()
+    assert set(page) == {"items", "total", "offset", "limit", "has_more"}

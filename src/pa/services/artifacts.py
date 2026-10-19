@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -208,6 +210,121 @@ def _fields(*pairs: tuple[str, Any]) -> list[dict[str, str]]:
     return out
 
 
+def build_email_cards(messages: list[Any]) -> list[dict[str, Any]]:
+    """Cards for triaged email messages.
+
+    The briefing reads messages from the database rather than from a tool,
+    and it knows things a raw Gmail payload does not: the triage priority,
+    whether a reply is needed, the deadlines it found. Those make a far
+    better card than the generic one.
+
+    ``messages`` are ``EmailMessage`` rows.
+    """
+    cards: list[dict[str, Any]] = []
+    for message in messages:
+        priority = _text(getattr(message, "priority", ""), 16).lower()
+        needs_reply = bool(getattr(message, "needs_reply", False))
+        subject = _text(getattr(message, "subject", ""), 200)
+        from_addr = _text(getattr(message, "from_addr", ""), 320)
+        summary = _text(getattr(message, "summary", ""), MAX_BODY_CHARS)
+        snippet = _text(getattr(message, "snippet", ""), MAX_BODY_CHARS)
+        received = _fmt_time(getattr(message, "received_at", None))
+        thread_id = _text(getattr(message, "thread_id", ""), 128)
+        message_id = _text(getattr(message, "id", ""), 64)
+        deadlines = _json_list(getattr(message, "deadlines", "[]"))
+
+        badges: list[dict[str, str]] = []
+        for label, value in (("Priority", priority), ("Needs reply", "yes" if needs_reply else "")):
+            badge = _badge(label, value)
+            if badge:
+                badges.append(badge)
+
+        fields = _fields(
+            ("From", from_addr),
+            ("Priority", priority),
+            ("Received", received),
+            ("Deadline", deadlines[0] if deadlines else ""),
+            ("Thread", thread_id),
+        )
+
+        actions: list[dict[str, Any]] = []
+        recipient = _extract_address(from_addr)
+        if recipient:
+            actions.append(
+                {
+                    "id": "reply",
+                    "label": "Draft reply",
+                    "kind": "reply",
+                    "recipient": recipient,
+                    "subject": subject if subject.lower().startswith("re:") else f"Re: {subject}".strip(),
+                }
+            )
+        if summary or snippet:
+            actions.append(
+                {
+                    "id": "summarise",
+                    "label": "Summarise",
+                    "kind": "ask",
+                    "prompt": f"Summarise the email '{subject}' from {from_addr}",
+                }
+            )
+        actions.append(
+            {
+                "id": "task",
+                "label": "Create task",
+                "kind": "ask",
+                "prompt": f"Create a task from the email '{subject}' from {from_addr}",
+            }
+        )
+
+        if needs_reply:
+            group = "Needs your reply"
+        elif priority == "high":
+            group = "High priority"
+        elif deadlines:
+            group = "Has a deadline"
+        else:
+            group = "Normal"
+
+        cards.append(
+            _card(
+                card_id=f"email:{message_id or thread_id or subject}",
+                app="email",
+                kind="message",
+                type_label="Email",
+                title=subject or "(no subject)",
+                subtitle=from_addr,
+                body=summary or snippet,
+                fields=fields,
+                badges=badges,
+                meta=received,
+                actions=actions,
+                group=group,
+                record_id=thread_id or message_id,
+            )
+        )
+    return cards
+
+
+def _json_list(value: Any) -> list[str]:
+    """A JSON list field as a list of strings."""
+    if isinstance(value, list):
+        return [str(v) for v in value if v]
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return []
+    return [str(v) for v in parsed if v] if isinstance(parsed, list) else []
+
+
+def _extract_address(addr: str) -> str:
+    """The email address in a From header."""
+    match = re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", addr or "")
+    return match.group(0) if match else ""
+
+
 def _card(
     *,
     card_id: str,
@@ -221,6 +338,8 @@ def _card(
     badges: list[dict[str, str]] | None = None,
     meta: str = "",
     actions: list[dict[str, Any]] | None = None,
+    group: str = "",
+    record_id: str = "",
 ) -> dict[str, Any]:
     """Assemble a card in the shape the frontend renders."""
     return {
@@ -235,6 +354,10 @@ def _card(
         "badges": badges or [],
         "meta": meta.strip()[:MAX_FIELD_CHARS],
         "actions": actions or [],
+        "group": group.strip()[:80],
+        # The id the app knows this record by, so the assistant can act on
+        # exactly this one.
+        "record_id": record_id.strip()[:128],
     }
 
 
@@ -475,6 +598,7 @@ def _hubspot_contact(record: dict[str, Any], app: str) -> dict[str, Any]:
             ("Contact ID", rec_id),
         ),
         actions=actions,
+        record_id=rec_id,
     )
 
 
@@ -497,6 +621,7 @@ def _hubspot_company(record: dict[str, Any], app: str) -> dict[str, Any]:
             ("Created", _fmt_time(_first(record, "createdate", "createdAt"))),
             ("Company ID", rec_id),
         ),
+        record_id=rec_id,
         actions=[
             {
                 "id": "note",
@@ -534,6 +659,7 @@ def _hubspot_deal(record: dict[str, Any], app: str) -> dict[str, Any]:
             ("Deal ID", rec_id),
         ),
         badges=[b for b in (_badge("Stage", stage),) if b],
+        record_id=rec_id,
         actions=[
             {
                 "id": "stage",
@@ -589,6 +715,7 @@ def _hubspot_ticket(record: dict[str, Any], app: str) -> dict[str, Any]:
         ),
         badges=badges,
         meta=created,
+        record_id=rec_id,
         actions=[
             {
                 "id": "note",

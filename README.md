@@ -64,6 +64,34 @@ record (a HubSpot engagement, a contact, a deal, ...) — and stored on the job.
 Drafting deliberately bypasses the agent loop, so "draft a reply" can never
 become a tool call that sends something. Only sending is approval-gated.
 
+### The inbox briefing is cards too
+
+A briefing does not come from a Composio tool — it reads **triaged messages
+from the database** — so it builds its own cards (`build_email_cards`).
+Those carry what a raw Gmail payload does not: the triage priority, whether
+a reply is needed, and the deadlines that were found.
+
+Only the messages worth acting on get a card (needing a reply, high
+priority, or carrying a deadline). The newsletter tail is left out on
+purpose — the prose already says it is safely ignorable, and 39 low-priority
+cards would bury the three that matter. Normal mail is summarised on
+demand, as the prose says.
+
+**A briefing covers every connected app**, not just the mailbox. Each app
+contributes a couple of read tools whose records become cards
+(`pa/services/briefing.py`). The tools are discovered by pattern as well as
+by name, so an app whose slugs were renamed still contributes.
+
+**Cards are paged.** `GET /api/v1/jobs/{id}/artifacts?offset=&limit=`
+returns `{items, total, offset, limit, has_more}`, and the chat loads the
+next page on demand. A briefing across several apps can surface dozens of
+records; the first screen shows a dozen.
+
+The endpoint **keeps its original contract**: without `limit` it returns the
+bare list. The API and the web are deployed separately, so a response shape
+must not change under a running frontend — and the frontend tolerates both
+shapes anyway.
+
 ## Working *with* a record, not just reading it
 
 Clicking a card **focuses** it. The focus is sent with the next message

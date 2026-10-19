@@ -188,3 +188,43 @@ def test_the_lookup_refuses_an_unknown_tool(monkeypatch):
     monkeypatch.setattr(tool_runner, "tool_index", lambda user_id: {})
     with pytest.raises(tool_runner.ToolError):
         tool_runner.execute_read("u1", "HUBSPOT_GET_PIPELINE_STAGES", {})
+
+
+# --- briefing sources ------------------------------------------------------
+
+
+def test_the_hubspot_briefing_source_discovers_its_list_tools():
+    """A renamed slug must still resolve, via the pattern fallback."""
+    from pa.services.briefing import SOURCES, _resolve_tool
+
+    index = {
+        "HUBSPOT_LIST_TICKETS": {"app": "hubspot", "classification": "read"},
+        "HUBSPOT_RETRIEVE_PIPELINE_STAGE_BY_ID": {
+            "app": "hubspot",
+            "classification": "read",
+        },
+        "HUBSPOT_CREATE_TICKET": {"app": "hubspot", "classification": "write"},
+    }
+    source = next(s for s in SOURCES["hubspot"] if s.group == "Tickets")
+    resolved = _resolve_tool(index, source)
+    assert resolved is not None
+    slug, _args = resolved
+    assert slug == "HUBSPOT_LIST_TICKETS"
+
+
+def test_a_briefing_source_never_picks_a_write_tool():
+    from pa.services.briefing import SOURCES, _resolve_tool
+
+    index = {
+        "HUBSPOT_CREATE_TICKET": {"app": "hubspot", "classification": "write"},
+    }
+    source = next(s for s in SOURCES["hubspot"] if s.group == "Tickets")
+    assert _resolve_tool(index, source) is None
+
+
+def test_an_app_with_no_sources_contributes_nothing():
+    from pa.services.briefing import build_app_cards
+
+    cards, sources = build_app_cards("u1", "notion", index={})
+    assert cards == []
+    assert sources == []

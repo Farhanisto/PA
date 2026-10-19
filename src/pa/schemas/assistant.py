@@ -97,7 +97,19 @@ class ArtifactResponse(BaseModel):
     fields: list[ArtifactField] = Field(default_factory=list)
     badges: list[ArtifactBadge] = Field(default_factory=list)
     meta: str = ""
+    group: str = ""
+    record_id: str = ""
     actions: list[ArtifactAction] = Field(default_factory=list)
+
+
+class ArtifactPageResponse(BaseModel):
+    """A page of cards, with enough context to fetch the next one."""
+
+    items: list[ArtifactResponse] = Field(default_factory=list)
+    total: int = 0
+    offset: int = 0
+    limit: int = 12
+    has_more: bool = False
 
 
 class ApprovalResponse(BaseModel):

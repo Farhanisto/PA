@@ -42,6 +42,8 @@ interface ReplyDraft {
 
 const TERMINAL = new Set(["completed", "failed", "waiting_for_approval"]);
 const POLL_MS = 1200;
+/** Cards fetched per page; the rest is loaded on demand. */
+const PAGE_SIZE = 12;
 
 const SUGGESTIONS = [
   "Summarise what needs my attention today",
@@ -58,9 +60,12 @@ function recordNoun(cards: Artifact[]): string {
 
 /** The record a card refers to, in the shape the assistant expects. */
 function focusOf(card: Artifact): AssistantFocus {
+  // The card carries the id the app knows the record by. Fall back to the
+  // field labels for cards built before that was set.
   const recordId =
-    card.fields.find((f) => /id$/i.test(f.label) && f.label !== "Engagement ID")?.value ??
-    card.fields.find((f) => f.label.endsWith("ID"))?.value ??
+    card.record_id ||
+    card.fields.find((f) => /id$/i.test(f.label) && f.label !== "Engagement ID")?.value ||
+    card.fields.find((f) => f.label.endsWith("ID"))?.value ||
     "";
   return {
     id: card.id,
@@ -81,6 +86,8 @@ export function AssistantPanel({ seed, onSeedConsumed }: { seed?: string; onSeed
   const [error, setError] = useState("");
   const [apps, setApps] = useState<Connection[] | null>(null);
   const [artifacts, setArtifacts] = useState<Record<string, Artifact[]>>({});
+  const [pages, setPages] = useState<Record<string, { total: number; hasMore: boolean }>>({});
+  const [loadingMore, setLoadingMore] = useState<string | null>(null);
   const [reply, setReply] = useState<ReplyDraft | null>(null);
   // The record the user clicked: the next message is about it, and the
   // assistant acts on that record rather than guessing which one.
@@ -149,14 +156,34 @@ export function AssistantPanel({ seed, onSeedConsumed }: { seed?: string; onSeed
     (async () => {
       for (const t of wanted) {
         try {
-          const cards = await jobApi.artifacts(t.jobId);
-          setArtifacts((prev) => ({ ...prev, [t.jobId]: cards }));
+          const page = await jobApi.artifacts(t.jobId, 0, PAGE_SIZE);
+          setArtifacts((prev) => ({ ...prev, [t.jobId]: page.items }));
+          setPages((prev) => ({
+            ...prev,
+            [t.jobId]: { total: page.total, hasMore: page.has_more },
+          }));
         } catch {
           setArtifacts((prev) => ({ ...prev, [t.jobId]: [] }));
+          setPages((prev) => ({ ...prev, [t.jobId]: { total: 0, hasMore: false } }));
         }
       }
     })();
   }, [turns, artifacts]);
+
+  /** Fetch the next page of cards for a run. */
+  async function loadMore(jobId: string) {
+    const current = artifacts[jobId] ?? [];
+    setLoadingMore(jobId);
+    try {
+      const page = await jobApi.artifacts(jobId, current.length, PAGE_SIZE);
+      setArtifacts((prev) => ({ ...prev, [jobId]: [...(prev[jobId] ?? []), ...page.items] }));
+      setPages((prev) => ({ ...prev, [jobId]: { total: page.total, hasMore: page.has_more } }));
+    } catch {
+      setError("Could not load more records.");
+    } finally {
+      setLoadingMore(null);
+    }
+  }
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -375,6 +402,7 @@ export function AssistantPanel({ seed, onSeedConsumed }: { seed?: string; onSeed
         {turns.map((t) => {
           const completed = t.status === "completed" && t.result;
           const cards = artifacts[t.jobId] ?? [];
+          const pageInfo = pages[t.jobId];
           const isReply = reply?.jobId === t.jobId;
           return (
             <div key={t.id} className="chat-turn">
@@ -422,7 +450,9 @@ export function AssistantPanel({ seed, onSeedConsumed }: { seed?: string; onSeed
                 <div className="artifact-block">
                   <div className="artifact-block-head">
                     <span className="artifact-count">
-                      {cards.length} {recordNoun(cards)}
+                      {pageInfo && pageInfo.total > cards.length
+                        ? `Showing ${cards.length} of ${pageInfo.total}`
+                        : `${cards.length} ${recordNoun(cards)}`}
                     </span>
                     <span className="tiny muted">Act on any of them</span>
                   </div>
@@ -433,6 +463,23 @@ export function AssistantPanel({ seed, onSeedConsumed }: { seed?: string; onSeed
                     selectedId={focus?.id ?? null}
                     disabled={busy}
                   />
+                  {pageInfo?.hasMore ? (
+                    <div className="artifact-more-row">
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        disabled={loadingMore === t.jobId}
+                        onClick={() => void loadMore(t.jobId)}
+                      >
+                        {loadingMore === t.jobId
+                          ? "Loading…"
+                          : `Show more (${pageInfo.total - cards.length} more)`}
+                      </button>
+                      <span className="tiny muted">
+                        Showing {cards.length} of {pageInfo.total}
+                      </span>
+                    </div>
+                  ) : null}
                   {completed ? (
                     <div className="result-actions artifact-actions-row">
                       <button

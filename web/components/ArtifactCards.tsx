@@ -184,6 +184,9 @@ function ArtifactCard({
 /**
  * The structured records a run surfaced, rendered as cards the user can act
  * on directly. This is the assistant's main engagement surface for app data.
+ *
+ * Cards that carry a group are shown under a heading, so a briefing reads
+ * as sections rather than one long list.
  */
 export function ArtifactCards({
   artifacts,
@@ -199,17 +202,33 @@ export function ArtifactCards({
   disabled?: boolean;
 }) {
   if (artifacts.length === 0) return null;
+
+  const groups: { name: string; items: Artifact[] }[] = [];
+  for (const card of artifacts) {
+    const name = card.group ?? "";
+    const last = groups[groups.length - 1];
+    if (last && last.name === name) last.items.push(card);
+    else groups.push({ name, items: [card] });
+  }
+
   return (
-    <div className="artifact-grid">
-      {artifacts.map((a) => (
-        <ArtifactCard
-          key={a.id}
-          artifact={a}
-          onAction={onAction}
-          onSelect={onSelect}
-          selected={selectedId === a.id}
-          disabled={disabled}
-        />
+    <div className="artifact-groups">
+      {groups.map((group, i) => (
+        <div key={`${group.name}-${i}`} className="artifact-group">
+          {group.name ? <h4 className="artifact-group-title">{group.name}</h4> : null}
+          <div className="artifact-grid">
+            {group.items.map((a) => (
+              <ArtifactCard
+                key={a.id}
+                artifact={a}
+                onAction={onAction}
+                onSelect={onSelect}
+                selected={selectedId === a.id}
+                disabled={disabled}
+              />
+            ))}
+          </div>
+        </div>
       ))}
     </div>
   );

@@ -581,7 +581,12 @@ def run_inbox_briefing(
             job = repositories.get_job(db, job_id)
             if job is not None and job.user_id == user_id:
                 repositories.update_job(
-                    db, job, status="completed", result=result["text"], finished=True
+                    db,
+                    job,
+                    status="completed",
+                    result=result["text"],
+                    artifacts=result.get("cards") or [],
+                    finished=True,
                 )
         _job_log(db, job, "email.briefing_ready", {"counts": result["counts"]} if job else {})
         log_event(

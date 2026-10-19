@@ -223,9 +223,9 @@ def test_a_hubspot_ticket_list_becomes_cards(client, account, hubspot_connected)
         finally:
             db.close()
 
-        r = client.get(f"/api/v1/jobs/{job_id}/artifacts", headers=account)
+        r = client.get(f"/api/v1/jobs/{job_id}/artifacts?limit=50", headers=account)
         assert r.status_code == 200, r.text
-        cards = r.json()
+        cards = r.json()["items"]
 
         assert len(cards) == 2, cards
         first = cards[0]
