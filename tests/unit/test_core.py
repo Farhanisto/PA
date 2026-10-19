@@ -816,6 +816,42 @@ def test_hubspot_insights_handles_empty():
     assert out["stats"] == []
 
 
+def test_gmail_insights_reads_the_messages_envelope():
+    """Gmail returns {"messages": [...]}, not {"results": [...]}."""
+    from pa.services import app_insights as ai
+
+    payload = json.dumps({"messages": [
+        {"subject": "Hello", "sender": "a@example.com", "messageId": "m1"},
+        {"subject": "Re: Hello", "sender": "b@example.com", "messageId": "m2"},
+    ]})
+    run = _Run({"GMAIL_FETCH_EMAILS": payload})
+    out = ai._gmail("u1", run)
+
+    assert "2 messages" in out["headline"]
+    assert out["stats"] == [{"label": "In inbox", "value": "2"}]
+    assert out["items"][0]["title"] == "Hello"
+    assert out["items"][0]["detail"] == "a@example.com"
+
+
+def test_gmail_insights_use_the_tools_real_arguments():
+    """``maxResults``/``q`` were renamed to ``max_results``/``query``."""
+    from pa.services import app_insights as ai
+
+    run = _Run({"GMAIL_FETCH_EMAILS": json.dumps({"messages": []})})
+    ai._gmail("u1", run)
+    tool, args = run.calls[0]
+    assert tool == "GMAIL_FETCH_EMAILS"
+    assert "query" in args and "max_results" in args
+    assert "maxResults" not in args and "q" not in args
+
+
+def test_gmail_insights_ask_for_few_messages():
+    """Whole message bodies come back, so a small limit is deliberate."""
+    from pa.services import app_insights as ai
+
+    assert ai.GMAIL_INSIGHT_LIMIT <= 20
+
+
 def test_hubspot_insights_tolerates_bad_amounts():
     from pa.services import app_insights as ai
 

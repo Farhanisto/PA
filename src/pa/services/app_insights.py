@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 # How many records to pull per feed; enough for a summary, cheap to fetch.
 LIST_LIMIT = 100
 
+# Gmail returns whole message bodies, so a dashboard asks for a handful: 100
+# messages is a multi-megabyte response the provider rejects outright.
+GMAIL_INSIGHT_LIMIT = 10
+
 
 def _iso(value: Any) -> datetime | None:
     if not value or not isinstance(value, str):
@@ -33,19 +37,16 @@ def _iso(value: Any) -> datetime | None:
 
 
 def _results(payload: Any) -> list[dict]:
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            return []
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-    if isinstance(payload, dict):
-        for key in ("results", "data", "items", "records"):
-            inner = payload.get(key)
-            if isinstance(inner, list):
-                return [x for x in inner if isinstance(x, dict)]
-    return []
+    """The records in a tool payload, whatever envelope it arrived in.
+
+    Delegates to the shared extractor, which searches for the record list
+    rather than guessing the key: Gmail returns ``{"messages": [...]}``,
+    HubSpot ``{"results": [...]}``, and the shape changes between SDK
+    versions.
+    """
+    from pa.services.artifacts import _records
+
+    return _records(payload)
 
 
 CLOSED_STAGES = {"closedwon", "closedlost", "closed_won", "closed_lost"}
@@ -107,8 +108,18 @@ def _hubspot(user_id: str, run: Callable[[str, dict], str]) -> dict[str, Any]:
 
 
 def _gmail(user_id: str, run: Callable[[str, dict], str]) -> dict[str, Any]:
-    """Mailbox shape, from whatever PA has already triaged."""
-    msgs = _results(run("GMAIL_FETCH_EMAILS", {"maxResults": LIST_LIMIT, "q": "in:inbox"}))
+    """Mailbox shape, from whatever PA has already triaged.
+
+    The tool's arguments are its real ones: ``query`` and ``max_results``.
+    (``maxResults`` and ``q`` were the old names and are now rejected.)
+
+    The limit is deliberately small. The tool returns whole message bodies,
+    so asking for 100 messages produces a multi-megabyte response that the
+    provider rejects as too large — and a dashboard needs a handful.
+    """
+    msgs = _results(
+        run("GMAIL_FETCH_EMAILS", {"query": "in:inbox", "max_results": GMAIL_INSIGHT_LIMIT})
+    )
     if not msgs:
         return {"headline": "Inbox is empty", "stats": [], "items": []}
     stats = [
@@ -118,7 +129,11 @@ def _gmail(user_id: str, run: Callable[[str, dict], str]) -> dict[str, Any]:
         "headline": f"{len(msgs)} message{'s' if len(msgs) != 1 else ''} in the inbox",
         "stats": stats,
         "items": [
-            {"title": m.get("subject") or "(no subject)", "detail": m.get("from", ""), "meta": ""}
+            {
+                "title": m.get("subject") or "(no subject)",
+                "detail": m.get("sender") or m.get("from") or "",
+                "meta": "",
+            }
             for m in msgs[:6]
         ],
     }
@@ -152,11 +167,27 @@ def app_insights(user_id: str, app: str) -> dict[str, Any]:
         }
 
     # Only ever run read-classified tools for a dashboard.
-    def run(tool: str, args: dict) -> str:
+    def run(tool: str, args: dict) -> Any:
+        """Run a read tool and return its payload.
+
+        The raw payload is used rather than the summarised text: a large
+        result (Gmail returns whole message bodies) would otherwise be cut
+        mid-JSON and stop parsing.
+        """
         meta = index.get(tool)
         if not meta or meta["classification"] != "read":
             raise ToolError(f"{tool} is not a permitted read tool")
-        return execute(user_id, tool, validate(index, tool, args))["result"]
+        from pa.services.tool_runner import fit_args
+
+        # Arguments are fitted to what the tool accepts: a renamed parameter
+        # must not break the whole summary.
+        fitted = fit_args(meta, args)
+        try:
+            checked = validate(index, tool, fitted)
+        except ToolError:
+            # Fall back to the tool's defaults rather than failing outright.
+            checked = validate(index, tool, {})
+        return execute(user_id, tool, checked).get("payload")
 
     try:
         summary = recipe(user_id, run)

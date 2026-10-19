@@ -112,6 +112,21 @@ hand, and Composio renames tools between SDK versions — several HubSpot
 slugs had drifted and would have taught the model to call tools that do not
 exist. The test is skipped when the catalog is not reachable.
 
+**Tool arguments drift the same way.** `GMAIL_FETCH_EMAILS` takes
+`query` and `max_results`, not the older `maxResults` and `q`, and a stale
+argument fails the whole call. Three defences:
+
+- `fit_args()` drops the arguments a tool no longer accepts, so a rename
+  costs one field rather than the feature;
+- the insights and enrichments fall back to the tool's defaults if the
+  fitted call still fails;
+- `tests/integration/test_insight_args.py` checks the dashboard recipes
+  against the live tool schemas.
+
+Tool results are also read as **raw payloads** rather than the summarised
+text: a large response (Gmail returns whole message bodies) truncated
+mid-JSON stops parsing, which looks exactly like an empty inbox.
+
 ## Checking a deployment
 
 `GET /api/v1/diagnostics` reports what a running build actually has: the

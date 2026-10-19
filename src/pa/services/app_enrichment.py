@@ -265,7 +265,6 @@ def _lookup(
         except Exception as exc:
             logger.warning("enrichment lookup %s failed: %s", slug, type(exc).__name__)
             continue
-        if _is_error_payload(payload):
             # The app rejected the request (e.g. a missing argument). Try the
             # next candidate rather than treating this as "no stages".
             logger.info("enrichment lookup %s returned an error payload", slug)

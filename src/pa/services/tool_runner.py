@@ -36,7 +36,11 @@ WRITE_VERBS = frozenset({
 })
 
 MAX_ARGS_BYTES = 20000
-MAX_RESULT_CHARS = 8000
+
+# A safety cap on the text form of a result. It is generous enough for a
+# real tool response (a list of CRM records), because truncating a JSON
+# payload mid-string produces text that no longer parses.
+MAX_RESULT_CHARS = 40000
 
 
 class ToolError(RuntimeError):
@@ -239,19 +243,41 @@ def _account_for(client, user_ref: str, tool_slug: str) -> str | None:
     return fallback
 
 
+def fit_args(meta: dict, args: dict) -> dict:
+    """Keep only the arguments a tool actually accepts.
+
+    Tool parameters get renamed and removed between SDK versions, and a
+    single stale argument makes the whole call fail with "Unknown
+    argument(s)". Dropping the ones the tool no longer has keeps the rest
+    working instead of breaking the feature.
+    """
+    props = meta.get("properties") or {}
+    if not props:
+        return args
+    return {k: v for k, v in args.items() if k in props}
+
+
 def execute_read(user_id: str, slug: str, args: dict | None = None) -> Any:
     """Run a read tool for the caller's own account and return its payload.
 
     Used for lookups that enrich a result (resolving a stage id to its
     name). Write tools are refused outright: a lookup that quietly mutated a
     record would be a nasty surprise.
+
+    Arguments are fitted to what the tool accepts, so a parameter that was
+    renamed between SDK versions is dropped rather than failing the call.
     """
     index = tool_index(user_id)
     if slug not in index:
         raise ToolError(f"{slug} is not available for your connected apps.")
     if index[slug].get("classification") != "read":
         raise ToolError(f"{slug} is not a read tool.")
-    checked = validate(index, slug, args or {})
+    fitted = fit_args(index[slug], args or {})
+    try:
+        checked = validate(index, slug, fitted)
+    except ToolError:
+        # Fall back to the tool's defaults.
+        checked = validate(index, slug, {})
     return execute(user_id, slug, checked).get("payload")
 
 
