@@ -462,3 +462,166 @@ def test_every_enqueued_task_name_exists_in_the_registry():
     # And the registry agrees with the decorators.
     for required in ("pa.run_inbox_briefing", "pa.run_assistant_job", "pa.resume_approved_workflow"):
         assert required in registered, f"{required} missing from the Celery registry"
+
+
+# --- Per-user proactive schedule ---
+
+
+def test_schedule_api_roundtrip(client):
+    hdr, _ = _signup(client)
+    r = client.get("/api/v1/settings/schedule", headers=hdr)
+    assert r.status_code == 200, r.text
+    assert r.json()["briefing_hour"] == 8
+    assert r.json()["timezone"] == "UTC"
+
+    r = client.put(
+        "/api/v1/settings/schedule",
+        json={"briefing_hour": 6, "briefing_minute": 45, "timezone": "Europe/London"},
+        headers=hdr,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["briefing_hour"] == 6
+    assert r.json()["briefing_minute"] == 45
+    assert r.json()["timezone"] == "Europe/London"
+
+
+def test_schedule_rejects_out_of_range_and_bad_timezone(client):
+    hdr, _ = _signup(client)
+    assert client.put("/api/v1/settings/schedule", json={"briefing_hour": 99}, headers=hdr).status_code == 422
+    assert client.put("/api/v1/settings/schedule", json={"timezone": "Mars/Olympus"}, headers=hdr).status_code == 400
+
+
+def test_schedule_is_per_user(client):
+    a_hdr, _ = _signup(client, "alpha@example.com")
+    b_hdr, _ = _signup(client, "beta@example.com")
+    client.put("/api/v1/settings/schedule", json={"briefing_hour": 5}, headers=a_hdr)
+    assert client.get("/api/v1/settings/schedule", headers=b_hdr).json()["briefing_hour"] == 8
+
+
+def test_tools_endpoint_is_generic_for_any_app(strict_client, fake_composio):
+    """One interface for all apps: a non-Google toolkit must work identically."""
+    from pa.integrations import catalog as catalog_mod
+
+    catalog_mod._tool_cache.clear()
+
+    class Tool:
+        def __init__(self, slug, name):
+            self.slug, self.name, self.description = slug, name, "crm op"
+
+    fake_composio.client.tools.list = lambda **k: type(
+        "R", (), {"items": [Tool("HUBSPOT_LIST_DEALS", "List deals")]}
+    )()
+
+    c = strict_client
+    hdr, _ = _signup(c)
+    r = c.get("/api/v1/integrations/hubspot/tools", headers=hdr)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["provider"] == "hubspot"
+    assert body["tool_count"] == 1
+    assert body["tools"][0]["slug"] == "HUBSPOT_LIST_DEALS"
+
+
+def test_tools_endpoint_rejects_junk_provider(strict_client):
+    c = strict_client
+    hdr, _ = _signup(c)
+    assert c.get("/api/v1/integrations/bad%3Bslug/tools", headers=hdr).status_code in (400, 404, 422)
+
+
+def test_read_only_tool_executes_without_approval(strict_client, fake_composio):
+    """A LIST tool runs immediately and feeds the summary."""
+    from pa.db.database import get_session_factory
+    from pa.db import repositories
+
+    from pa.auth.service import create_user
+
+    uid = create_user(
+        get_session_factory()(), email="tools@example.com", password="Str0ngPassw0rd"
+    )[0].id
+
+    from pa.services import tool_runner
+
+    index = tool_runner.tool_index(uid)
+    assert "GMAIL_FETCH_EMAILS" in index, index.keys()
+    assert index["GMAIL_FETCH_EMAILS"]["classification"] == "read"
+
+    out = tool_runner.execute(uid, "GMAIL_FETCH_EMAILS", {})
+    assert out["tool"] == "GMAIL_FETCH_EMAILS"
+    assert "id" in out["result"]
+    # Both ids must be sent; Composio 400s without user_id.
+    call = fake_composio.executed[-1]
+    assert call["user_id"] == uid and call["account"] == "ca-1"
+
+
+def test_execute_refuses_when_nothing_connected(fake_composio):
+    from pa.services import tool_runner
+
+    fake_composio.connected = False
+    with pytest.raises(tool_runner.ToolError) as e:
+        tool_runner.execute("u1", "GMAIL_FETCH_EMAILS", {})
+    assert "no connected apps" in str(e.value).lower()
+
+
+def test_approved_write_tool_executes(strict_client, fake_composio):
+    from pa.auth.service import create_user
+    """After approval the exact tool + args run, and the job records it."""
+    from pa.auth.service import create_user
+    from pa.auth.service import create_user
+    from pa.auth.service import create_user
+    from pa.db.database import get_session_factory
+    from pa.db import repositories
+    from pa.queue import tasks as q_tasks
+
+    db = get_session_factory()()
+    user = create_user(db, email="writer@example.com", password="Str0ngPassw0rd")[0]
+    job = repositories.create_job(db, user_id=user.id, request="create a deal")
+    approval = repositories.create_approval(
+        db, job_id=job.id, thread_id=job.thread_id, user_id=user.id, action="composio_tool",
+        payload={"tool": "GMAIL_SEND_EMAIL", "app": "gmail",
+                 "args": {"to": "a@b.com", "subject": "s", "body": "b"}},
+    )
+    db.commit()
+
+    out = q_tasks._execute_approved_tool(
+        db, job, approval, {"tool": "GMAIL_SEND_EMAIL", "app": "gmail",
+                            "args": {"to": "a@b.com", "subject": "s", "body": "b"}}
+    )
+    assert out["ok"] is True, out
+    assert out["tool"] == "GMAIL_SEND_EMAIL"
+    assert fake_composio.executed[-1]["user_id"] == user.id
+
+
+def test_approved_payload_cannot_be_widened_to_another_app(strict_client, fake_composio):
+    from pa.auth.service import create_user
+    """A tampered approval must not run a tool from an unconnected app."""
+    from pa.db.database import get_session_factory
+    from pa.db import repositories
+    from pa.queue import tasks as q_tasks
+
+    db = get_session_factory()()
+    user = create_user(db, email="tamper@example.com", password="Str0ngPassw0rd")[0]
+    job = repositories.create_job(db, user_id=user.id, request="x")
+    db.commit()
+
+    out = q_tasks._execute_approved_tool(
+        db, job, None, {"tool": "HUBSPOT_DELETE_ALL_COMPANIES", "args": {}}
+    )
+    assert out["ok"] is False
+    assert "not available" in out["error"]
+
+
+def test_read_tool_cannot_be_executed_through_the_approval_path(strict_client, fake_composio):
+    from pa.auth.service import create_user
+    """Only writes may run via approval; a read must not slip through."""
+    from pa.db.database import get_session_factory
+    from pa.db import repositories
+    from pa.queue import tasks as q_tasks
+
+    db = get_session_factory()()
+    user = create_user(db, email="readguy@example.com", password="Str0ngPassw0rd")[0]
+    job = repositories.create_job(db, user_id=user.id, request="x")
+    db.commit()
+
+    out = q_tasks._execute_approved_tool(db, job, None, {"tool": "GMAIL_FETCH_EMAILS", "args": {}})
+    assert out["ok"] is False
+    assert "not a write tool" in out["error"]

@@ -162,6 +162,77 @@ def connect(
 
 
 @router.get(
+    "/integrations/tools",
+    response_model=list[ToolkitToolsResponse],
+    summary="Tools for every connected app",
+    description="One row per connected app with its tool list, so the UI needs a single call.",
+)
+def all_toolkit_tools(
+    limit: int = Query(default=200, ge=1, le=500),
+    user_id: str = Depends(get_current_user),
+):
+    """Tool inventory for all of the caller's connections."""
+    states = catalog_mod.connection_states(user_id, [])
+    rows: list[ToolkitToolsResponse] = []
+    try:
+        connections = [
+            app for app in catalog_mod.list_apps()
+            if app["slug"] in states
+        ]
+    except Exception as exc:
+        raise _composio_http_error(exc) if isinstance(exc, ComposioError) else HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not list apps: {exc}"
+        )
+    for app in connections:
+        state = states.get(app["slug"], "none")
+        try:
+            tools = catalog_mod.list_tools(app["slug"], limit=limit)
+        except Exception:
+            tools = []
+        rows.append(
+            ToolkitToolsResponse(
+                provider=app["slug"],
+                connected=state == "active",
+                state=state,
+                tool_count=len(tools),
+                tools=[ToolInfo(**t) for t in tools],
+            )
+        )
+    return rows
+
+
+@router.get(
+    "/integrations/{provider}/insights",
+    summary="Dashboard summary for an app",
+    description="Read-only rollup of one connected app for the dashboard.",
+)
+def integration_insights(
+    provider: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Summarise one connected app using read-classified tools only."""
+    try:
+        app = composio_client.toolkit_slug(provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    from pa.services.app_insights import app_insights
+
+    state = composio_client.connection_state(user_id, app)
+    if state != "active":
+        return {
+            "app": app,
+            "connected": False,
+            "state": state,
+            "available": False,
+            "headline": "",
+            "stats": [],
+            "items": [],
+        }
+    return {**app_insights(user_id, app), "connected": True, "state": state}
+
+
+@router.get(
     "/integrations/{provider}/tools",
     response_model=ToolkitToolsResponse,
     summary="Tools available for an app",
@@ -176,7 +247,10 @@ def toolkit_tools(
     user_id: str = Depends(get_current_user),
 ):
     """List the callable tools for one of the caller's connected apps."""
-    slug = composio_client.toolkit_slug(provider)
+    try:
+        slug = composio_client.toolkit_slug(provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     state = composio_client.connection_state(user_id, slug)
     try:
         tools = catalog_mod.list_tools(slug, limit=limit)

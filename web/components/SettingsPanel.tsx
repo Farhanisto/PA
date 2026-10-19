@@ -1,10 +1,28 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { ApiError, authApi, healthApi, obsApi } from "@/lib/api";
+import { ApiError, authApi, healthApi, obsApi, settingsApi, type Schedule } from "@/lib/api";
 import { PermissionsPanel } from "./PermissionsPanel";
 import { useAuth } from "./AuthProvider";
 import { Badge, Card, ErrorBox, Notice, Skeleton, usd } from "./ui";
+
+const TIMEZONES = [
+  "UTC",
+  "Africa/Nairobi",
+  "Africa/Lagos",
+  "Africa/Johannesburg",
+  "Europe/London",
+  "Europe/Berlin",
+  "Europe/Paris",
+  "America/New_York",
+  "America/Chicago",
+  "America/Los_Angeles",
+  "Asia/Dubai",
+  "Asia/Kolkata",
+  "Asia/Singapore",
+  "Asia/Tokyo",
+  "Australia/Sydney",
+];
 
 function err(e: unknown): string {
   return e instanceof ApiError ? `Request failed (${e.status}): ${e.message}` : "Something went wrong.";
@@ -81,6 +99,140 @@ function SystemPanel() {
   );
 }
 
+function SchedulePanel() {
+  const [schedule, setSchedule] = useState<Schedule | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      setSchedule(await settingsApi.schedule());
+    } catch (e) {
+      setError(err(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function save(patch: Partial<Schedule>) {
+    if (!schedule) return;
+    setSaving(true);
+    setError("");
+    setNotice("");
+    try {
+      const next = await settingsApi.setSchedule(patch);
+      setSchedule(next);
+      setNotice("Schedule saved.");
+    } catch (e) {
+      setError(err(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const tz = schedule?.timezone || "UTC";
+
+  return (
+    <Card
+      title="Update schedule"
+      hint="Choose when the assistant should proactively brief you. Times are local to you."
+      actions={
+        <button type="button" className="btn btn-sm" onClick={() => void load()} disabled={loading}>
+          Reload
+        </button>
+      }
+    >
+      {loading ? <Skeleton rows={2} /> : null}
+      {notice ? <Notice tone="ok">{notice}</Notice> : null}
+      {error ? <ErrorBox message={error} /> : null}
+
+      {schedule ? (
+        <>
+          <div className="schedule-row">
+            <div className="schedule-text">
+              <strong>Daily inbox briefing</strong>
+              <span className="small muted">
+                A summary of what needs your attention.
+              </span>
+            </div>
+            <input
+              type="time"
+              value={`${String(schedule.briefing_hour).padStart(2, "0")}:${String(schedule.briefing_minute).padStart(2, "0")}`}
+              onChange={(e) => {
+                const [h, m] = e.target.value.split(":").map(Number);
+                void save({ briefing_hour: h, briefing_minute: m });
+              }}
+              disabled={saving}
+              aria-label="Daily briefing time"
+            />
+            <button
+              type="button"
+              role="switch"
+              aria-checked={schedule.briefing_enabled}
+              className={`btn btn-sm ${schedule.briefing_enabled ? "btn-primary" : ""}`}
+              disabled={saving}
+              onClick={() => void save({ briefing_enabled: !schedule.briefing_enabled })}
+            >
+              {schedule.briefing_enabled ? "On" : "Off"}
+            </button>
+          </div>
+
+          <div className="schedule-row">
+            <div className="schedule-text">
+              <strong>Follow-up reminders</strong>
+              <span className="small muted">Threads waiting on a reply from you.</span>
+            </div>
+            <input
+              type="time"
+              value={`${String(schedule.followup_hour).padStart(2, "0")}:${String(schedule.followup_minute).padStart(2, "0")}`}
+              onChange={(e) => {
+                const [h, m] = e.target.value.split(":").map(Number);
+                void save({ followup_hour: h, followup_minute: m });
+              }}
+              disabled={saving}
+              aria-label="Follow-up reminder time"
+            />
+            <button
+              type="button"
+              role="switch"
+              aria-checked={schedule.followup_enabled}
+              className={`btn btn-sm ${schedule.followup_enabled ? "btn-primary" : ""}`}
+              disabled={saving}
+              onClick={() => void save({ followup_enabled: !schedule.followup_enabled })}
+            >
+              {schedule.followup_enabled ? "On" : "Off"}
+            </button>
+          </div>
+
+          <div className="field" style={{ maxWidth: 320, marginTop: 16 }}>
+            <label htmlFor="tz-select">Timezone</label>
+            <select
+              id="tz-select"
+              value={tz}
+              disabled={saving}
+              onChange={(e) => void save({ timezone: e.target.value })}
+            >
+              {TIMEZONES.map((z) => (
+                <option key={z} value={z}>
+                  {z}
+                </option>
+              ))}
+            </select>
+            <span className="help">Times above are interpreted in this timezone.</span>
+          </div>
+        </>
+      ) : null}
+    </Card>
+  );
+}
+
 function AccountPanel() {
   const { user, logout, refreshUser } = useAuth();
   const [busy, setBusy] = useState(false);
@@ -139,6 +291,7 @@ function AccountPanel() {
 export function SettingsPanel() {
   return (
     <div className="stack-md">
+      <SchedulePanel />
       <PermissionsPanel />
       <AccountPanel />
       <SystemPanel />

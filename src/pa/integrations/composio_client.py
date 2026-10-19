@@ -201,7 +201,7 @@ def invalidate_states(user_id: str | None = None) -> None:
         _state_cache.pop(user_ref(user_id), None)
 
 
-def connection_states(user_id: str, org_id: str | None = None) -> dict[str, str]:
+def connection_states(user_id: str, org_id: str | None = None) -> dict[str, str] | None:
     """Map toolkit slug -> state for ONE user, in a single API call.
 
     Querying per toolkit is an N+1 against the network: with ~60 toolkits that
@@ -210,6 +210,9 @@ def connection_states(user_id: str, org_id: str | None = None) -> dict[str, str]
     Results are cached briefly and invalidated explicitly whenever we connect
     or revoke, so repeated page loads do not pay a round trip while a genuine
     change is still reflected immediately.
+
+    Returns {} when the user genuinely has no connections, and None when
+    Composio could not be reached -- callers must not confuse the two.
     """
     if not is_configured():
         return {}
@@ -224,7 +227,7 @@ def connection_states(user_id: str, org_id: str | None = None) -> dict[str, str]
         resp = client.client.connected_accounts.list(user_ids=[ref], limit=100)
     except Exception as exc:
         logger.warning("composio status check failed: %s", type(exc).__name__)
-        return {}
+        return None
     out: dict[str, str] = {}
     for item in _unwrap_items(resp):
         slug = _item_toolkit_slug(item)
@@ -243,7 +246,8 @@ def connection_state(user_id: str, provider: str, client=None, org_id: str | Non
     slug = toolkit_slug(provider)
     if not is_configured():
         return "unavailable"
-    return connection_states(user_id, org_id=org_id).get(slug, "none")
+    states = connection_states(user_id, org_id=org_id)
+    return "unavailable" if states is None else states.get(slug, "none")
 
 
 def revoke_connection(user_id: str, provider: str, client=None, org_id: str | None = None) -> bool:

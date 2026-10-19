@@ -196,3 +196,35 @@ class ToolkitToolsResponse(BaseModel):
     state: str
     tool_count: int
     tools: list[ToolInfo]
+
+
+class ScheduleUpdate(BaseModel):
+    briefing_enabled: bool | None = None
+    briefing_hour: int | None = Field(default=None, ge=0, le=23)
+    briefing_minute: int | None = Field(default=None, ge=0, le=59)
+    followup_enabled: bool | None = None
+    followup_hour: int | None = Field(default=None, ge=0, le=23)
+    followup_minute: int | None = Field(default=None, ge=0, le=59)
+    timezone: str | None = Field(default=None, max_length=64)
+
+
+class ScheduleResponse(BaseModel):
+    briefing_enabled: bool
+    briefing_hour: int
+    briefing_minute: int
+    followup_enabled: bool
+    followup_hour: int
+    followup_minute: int
+    timezone: str
+
+    @classmethod
+    def from_row(cls, row) -> "ScheduleResponse":
+        return cls(
+            briefing_enabled=row.briefing_enabled,
+            briefing_hour=row.briefing_hour,
+            briefing_minute=row.briefing_minute,
+            followup_enabled=row.followup_enabled,
+            followup_hour=row.followup_hour,
+            followup_minute=row.followup_minute,
+            timezone=row.timezone,
+        )

@@ -11,6 +11,10 @@ class AssistantState(TypedDict, total=False):
     task_items: list[str]
     notes: list[str]
     context: str
+    app_context: str
+    connected_apps: list[str]
+    tool_call: dict
+    tool_result: dict
     proposed_action: dict
     approval_status: str  # not_required | pending | approved | rejected
     error: str

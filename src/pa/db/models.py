@@ -230,3 +230,27 @@ class ToolCall(Base):
     output_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
     error: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class UserSchedule(Base):
+    """When this user wants proactive updates.
+
+    Celery beat cannot express per-user times, so beat runs a frequent
+    dispatcher that consults these rows and fans out one task per due user.
+    """
+
+    __tablename__ = "user_schedules"
+
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), primary_key=True
+    )
+    briefing_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    briefing_hour: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
+    briefing_minute: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    followup_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    followup_hour: Mapped[int] = mapped_column(Integer, nullable=False, default=16)
+    followup_minute: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )

@@ -3,8 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiError,
+  appApi,
   assistantApi,
   jobApi,
+  type Connection,
   type Job,
 } from "@/lib/api";
 import { Badge, Card, EmptyState, ErrorBox, Notice } from "./ui";
@@ -31,12 +33,26 @@ const SUGGESTIONS = [
   "Give me a daily briefing",
 ];
 
-export function AssistantPanel() {
+export function AssistantPanel({ seed, onSeedConsumed }: { seed?: string; onSeedConsumed?: () => void }) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [apps, setApps] = useState<Connection[] | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
+
+  // Show which apps the assistant can actually reach.
+  const loadApps = useCallback(async () => {
+    try {
+      setApps(await appApi.connections());
+    } catch {
+      setApps([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadApps();
+  }, [loadApps]);
 
   const update = useCallback((jobId: string, patch: Partial<Turn>) => {
     setTurns((prev) => prev.map((t) => (t.jobId === jobId ? { ...t, ...patch } : t)));
@@ -75,6 +91,15 @@ export function AssistantPanel() {
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [turns]);
+
+  // A tool picked in the Workspace prefills the composer.
+  useEffect(() => {
+    if (seed) {
+      setDraft(seed);
+      onSeedConsumed?.();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seed]);
 
   async function send(text: string) {
     const prompt = text.trim();
@@ -142,6 +167,26 @@ export function AssistantPanel() {
       }
     >
       {error ? <ErrorBox message={error} /> : null}
+
+      <div className="app-scope">
+        {apps === null ? (
+          <span className="tiny muted">Checking connected apps…</span>
+        ) : apps.length === 0 ? (
+          <span className="tiny muted">
+            No apps connected — the assistant can&apos;t do anything yet. Connect one in Apps.
+          </span>
+        ) : (
+          <>
+            <span className="tiny muted">PA can work in:</span>
+            {apps.map((a) => (
+              <span key={a.provider} className="scope-chip">
+                {a.name}
+                {a.state === "active" ? null : " (not connected)"}
+              </span>
+            ))}
+          </>
+        )}
+      </div>
 
       <div className="chat" ref={logRef} aria-live="polite" aria-label="Conversation">
         {turns.length === 0 ? (

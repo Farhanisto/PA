@@ -16,6 +16,7 @@ from pa.api.routes.integrations import router as integrations_router
 from pa.api.routes.jobs import router as jobs_router
 from pa.api.routes.memory import router as memory_router
 from pa.api.routes.observability import router as observability_router
+from pa.api.routes.settings import router as settings_router
 from pa.db.database import get_session_factory, init_db
 from pa.observability import set_correlation_id
 
@@ -106,6 +107,7 @@ def create_app() -> FastAPI:
     app.include_router(approvals_router, prefix="/api/v1", tags=["approvals"])
     app.include_router(memory_router, prefix="/api/v1", tags=["memory"])
     app.include_router(integrations_router, prefix="/api/v1", tags=["integrations"])
+    app.include_router(settings_router, prefix="/api/v1", tags=["settings"])
 
     @app.get("/health", tags=["ops"], summary="Liveness probe")
     def health():

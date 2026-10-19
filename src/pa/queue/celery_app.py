@@ -17,13 +17,6 @@ def _backend_url() -> str | None:
     return os.getenv("CELERY_RESULT_BACKEND") or get_settings().CELERY_RESULT_BACKEND
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
 celery_app = Celery(
     "pa",
     broker=_broker_url(),
@@ -44,18 +37,12 @@ celery_app.conf.update(
     timezone="Africa/Nairobi",
     enable_utc=True,
     beat_schedule={
-        # Proactive email assistant: inbox briefings + follow-up reminders.
-        "inbox-briefings": {
-            "task": "pa.run_inbox_briefings",
-            "schedule": crontab(
-                hour=_env_int("INBOX_BRIEFING_HOUR", 8), minute=_env_int("INBOX_BRIEFING_MINUTE", 0)
-            ),
-        },
-        "followup-reminders": {
-            "task": "pa.run_followup_reminders",
-            "schedule": crontab(
-                hour=_env_int("FOLLOWUP_HOUR", 16), minute=_env_int("FOLLOWUP_MINUTE", 0)
-            ),
+        # Per-user times cannot be expressed in crontab, so a dispatcher runs
+        # every 15 minutes and fans out one task per user whose local time has
+        # arrived. See pa.dispatch_due_updates.
+        "dispatch-due-updates": {
+            "task": "pa.dispatch_due_updates",
+            "schedule": crontab(minute="*/15"),
         },
     },
 )

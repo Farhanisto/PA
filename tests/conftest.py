@@ -151,6 +151,12 @@ class _FakeTools:
     def __init__(self, owner):
         self._owner = owner
 
+    def list(self, toolkit_slug=None, **_kwargs):
+        """Tool inventory for a toolkit (mirrors tools.list in the SDK)."""
+        if toolkit_slug and toolkit_slug != "gmail":
+            return type("R", (), {"items": []})()
+        return type("R", (), {"items": list(self._owner.tools)})()
+
     def execute(self, *, tool_slug, arguments, connected_account_id, user_id=None):
         # Composio rejects a connected_account_id without a user_id (400), so
         # the double enforces the same contract.
@@ -200,6 +206,48 @@ class FakeComposio:
     def __init__(self):
         self.sent: list[dict] = []
         self.executed: list[dict] = []
+        def _tool(slug, name, desc, required=(), props=None, deprecated=False):
+            return type(
+                "T", (),
+                {
+                    "slug": slug,
+                    "name": name,
+                    "description": desc,
+                    "is_deprecated": deprecated,
+                    "input_parameters": {
+                        "required": list(required),
+                        "properties": props or {},
+                    },
+                },
+            )()
+
+        self.tools = [
+            _tool("GMAIL_FETCH_EMAILS", "Fetch emails", "Fetch mail"),
+            _tool(
+                "GMAIL_SEND_EMAIL", "Send email", "Send mail",
+                required=["to", "subject", "body"],
+                props={
+                    "to": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"},
+                    "thread_id": {"type": "string"},
+                },
+            ),
+            _tool(
+                "GMAIL_CREATE_EMAIL_DRAFT", "Create draft", "Draft mail",
+                required=["to", "body"],
+                props={"to": {"type": "string"}, "body": {"type": "string"}},
+            ),
+            _tool(
+                "HUBSPOT_LIST_DEALS", "List deals", "List deals in HubSpot",
+                props={"limit": {"type": "integer"}, "after": {"type": "string"}},
+            ),
+            _tool(
+                "HUBSPOT_CREATE_DEAL", "Create deal", "Create a HubSpot deal",
+                required=["dealname"],
+                props={"dealname": {"type": "string"}, "amount": {"type": "string"}},
+            ),
+        ]
         self.inbox = [dict(m) for m in FAKE_INBOX]
         self.connected = True
         self.client = _FakeSDK(self)
@@ -207,11 +255,20 @@ class FakeComposio:
 
 @pytest.fixture(autouse=True)
 def fake_composio():
+    from pa.integrations import catalog as catalog_mod
     from pa.integrations import composio_client
 
     fake = FakeComposio()
     composio_client.set_client_factory(lambda: fake)
+    # These caches are module-level singletons in production; clear them so one
+    # test's cached result cannot leak into the next.
+    composio_client.invalidate_states()
+    catalog_mod._catalog_cache["at"] = 0.0
+    catalog_mod._catalog_cache["apps"] = None
+    catalog_mod._tool_cache.clear()
     try:
         yield fake
     finally:
         composio_client.clear_client_factory()
+        composio_client.invalidate_states()
+        catalog_mod._tool_cache.clear()

@@ -3,6 +3,7 @@
 import json
 import logging
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 from celery.exceptions import Retry
@@ -155,10 +156,26 @@ def run_assistant_job(self, job_id: str) -> dict:
             snippets = context_snippets(db, user_id=job.user_id)
         except Exception:
             snippets = []
+
+        # Which apps this user has actually connected, and their tools.
+        try:
+            from pa.services.app_context import connected_apps_context
+
+            app_ctx = connected_apps_context(job.user_id)
+        except Exception as exc:
+            log_event(
+                logger, logging.WARNING, "app context unavailable",
+                job_id=job.id, user_id=job.user_id,
+                details={"error": str(exc)[:200]},
+            )
+            app_ctx = {"text": "", "apps": [], "tools": {}}
+
         initial_state = {
             "user_id": job.user_id,
             "request": job.request,
             "memory_snippets": snippets,
+            "app_context": app_ctx["text"],
+            "connected_apps": app_ctx["apps"],
         }
         job_id, thread_id = job.id, job.thread_id
         # Release the read snapshot before the graph run: the checkpointer
@@ -286,6 +303,63 @@ def _handle_interrupt(db, job, proposal: dict) -> dict:
     return {"ok": True, "status": "waiting_for_approval", "approval_id": approval.id}
 
 
+def _execute_approved_tool(db, job, approval, payload: dict) -> dict:
+    """Run the exact Composio tool the user approved.
+
+    The payload was frozen when the approval was created, and it is re-validated
+    against the caller's connected apps here so a tampered record cannot widen
+    the blast radius.
+    """
+    from pa.services import tracing as _tracing
+    from pa.services.tool_runner import ToolError, execute, tool_index, validate
+
+    tool = payload.get("tool")
+    if not isinstance(tool, str) or not tool:
+        repositories.update_job(db, job, status="failed", error_code="bad_payload", finished=True)
+        return {"ok": False, "error": "approval payload missing tool"}
+
+    args = payload.get("args") or {}
+    if not isinstance(args, dict):
+        args = {}
+
+    try:
+        index = tool_index(job.user_id)
+        checked = validate(index, tool, args)
+        # Re-classify: if the tool is not a write it should never have been
+        # gated, but refuse rather than silently widening what runs.
+        if index[tool]["classification"] != "write":
+            raise ValueError(f"{tool} is not a write tool and cannot be approved here")
+
+        job_id = job.id
+        db.commit()
+        with _tracing.trace_tool(
+            db,
+            user_id=job.user_id,
+            job_id=job_id,
+            tool_name=tool,
+            args=checked,
+        ) as rec:
+            result = execute(job.user_id, tool, checked)
+            rec["output"] = {"result": result.get("result", "")[:2000]}
+    except ToolError as exc:
+        repositories.update_job(db, job, status="failed", error_code="tool_error", finished=True)
+        _job_log(db, job, "tool.failed", {"tool": tool, "error": str(exc)[:300]})
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        repositories.update_job(db, job, status="failed", error_code="tool_error", finished=True)
+        _job_log(db, job, "tool.failed", {"tool": tool, "error": str(exc)[:300]})
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+    summary = result.get("result", "")[:2000]
+    repositories.update_job(
+        db, job, status="completed",
+        result=f"Ran {tool} in {index[tool]['app']}.\n{summary}",
+        finished=True,
+    )
+    _job_log(db, job, "tool.approved_and_run", {"tool": tool, "approval_id": approval.id})
+    return {"ok": True, "status": "completed", "tool": tool}
+
+
 @celery_app.task(bind=True, name="pa.resume_approved_workflow", max_retries=3)
 def resume_approved_workflow(self, approval_id: str) -> dict:
     init_db()
@@ -325,6 +399,8 @@ def resume_approved_workflow(self, approval_id: str) -> dict:
             from pa.services import email_service as email_svc
             from pa.services import tracing as _tracing
 
+            if approval.action == "composio_tool":
+                return _execute_approved_tool(db, job, approval, payload)
             if approval.action != "email_send_draft":
                 raise ValueError(f"unsupported approval action: {approval.action}")
             if not permission_granted(db, user_id=job.user_id, key=PERM_SEND_EMAIL):
@@ -514,3 +590,62 @@ def run_inbox_briefings(scheduled_for: str = "") -> dict:
                 extra={"error": str(exc)[:200]},
             )
     return {"ok": True, "enqueued": enqueued}
+
+
+def _is_due(schedule, *, which: str, now_local) -> bool:
+    """True when a user's chosen local time falls inside this dispatcher window."""
+    if which == "briefing":
+        if not schedule.briefing_enabled:
+            return False
+        hour, minute = schedule.briefing_hour, schedule.briefing_minute
+    else:
+        if not schedule.followup_enabled:
+            return False
+        hour, minute = schedule.followup_hour, schedule.followup_minute
+    target = hour * 60 + minute
+    current = now_local.hour * 60 + now_local.minute
+    # Beat runs every 15 minutes; fire once when we cross the target.
+    return target <= current < target + 15
+
+
+@celery_app.task(name="pa.dispatch_due_updates")
+def dispatch_due_updates() -> dict:
+    """Fan out one briefing/follow-up per user at *their* chosen local time.
+
+    Celery's crontab is global, so it cannot express per-user times; this
+    dispatcher runs frequently and fires each user once their local window
+    is reached.
+    """
+    from pa.observability import log_event
+
+    init_db()
+    session = get_session_factory()()
+    sent: dict[str, list[str]] = {"briefing": [], "followup": []}
+    try:
+        for schedule in repositories.list_schedules(session):
+            try:
+                from zoneinfo import ZoneInfo
+
+                now_local = datetime.now(ZoneInfo(schedule.timezone))
+            except Exception:
+                now_local = datetime.now(UTC)
+
+            if _is_due(schedule, which="briefing", now_local=now_local):
+                try:
+                    run_inbox_briefing.delay(schedule.user_id, now_local.isoformat())
+                    sent["briefing"].append(schedule.user_id)
+                except Exception as exc:
+                    log_event(logger, "briefing_enqueue_failed", user_id=schedule.user_id,
+                              details={"error": str(exc)[:200]})
+            if _is_due(schedule, which="followup", now_local=now_local):
+                try:
+                    from pa.services import proactive
+
+                    proactive.build_followup_reminders(session, user_id=schedule.user_id)
+                    sent["followup"].append(schedule.user_id)
+                except Exception as exc:
+                    log_event(logger, "followup_failed", user_id=schedule.user_id,
+                              details={"error": str(exc)[:200]})
+    finally:
+        session.close()
+    return {"dispatched": sent}

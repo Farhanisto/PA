@@ -276,3 +276,37 @@ def list_audit_events(
             .limit(limit)
         )
     return list(db.scalars(stmt).all())
+
+
+# --- User schedules (per-user proactive delivery) ---
+
+
+def get_schedule(db: Session, user_id: str) -> "UserSchedule":
+    """Return the user's schedule, creating defaults on first access."""
+    from pa.db.models import UserSchedule
+
+    row = db.get(UserSchedule, user_id)
+    if row is None:
+        row = UserSchedule(user_id=user_id)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+    return row
+
+
+def update_schedule(db: Session, user_id: str, **fields) -> "UserSchedule":
+    row = get_schedule(db, user_id)
+    for key, value in fields.items():
+        if value is not None and hasattr(row, key):
+            setattr(row, key, value)
+    row.updated_at = _utcnow()
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def list_schedules(db: Session) -> list:
+    from pa.db.models import UserSchedule
+
+    return list(db.scalars(select(UserSchedule)).all())

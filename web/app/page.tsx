@@ -5,6 +5,7 @@ import { AuthProvider, useAuth } from "@/components/AuthProvider";
 import { AppsPanel } from "@/components/AppsPanel";
 import { ApprovalBell } from "@/components/ApprovalBell";
 import { ApprovalsPanel } from "@/components/ApprovalsPanel";
+import { AppWorkspace } from "@/components/AppWorkspace";
 import { AssistantPanel } from "@/components/AssistantPanel";
 import { DashboardPanel } from "@/components/DashboardPanel";
 import { DraftsPanel } from "@/components/DraftsPanel";
@@ -19,6 +20,7 @@ import type { EmailMessage } from "@/lib/api";
 
 type SectionId =
   | "dashboard"
+  | "workspace"
   | "assistant"
   | "apps"
   | "settings"
@@ -37,8 +39,9 @@ const NAV: NavGroup[] = [
     group: "PA",
     primary: true,
     items: [
-      { id: "dashboard", label: "Dashboard", icon: "◎", hint: "Everything your apps have done" },
+      { id: "dashboard", label: "Dashboard", icon: "◎", hint: "What needs you today" },
       { id: "assistant", label: "Assistant", icon: "✦", hint: "Talk to the agent" },
+      { id: "workspace", label: "Workspace", icon: "◫", hint: "One interface for every app" },
       { id: "apps", label: "Apps", icon: "⊞", hint: "Connect or disconnect apps" },
       { id: "settings", label: "Settings", icon: "⚙", hint: "Permissions and system" },
     ],
@@ -184,6 +187,7 @@ function Shell() {
   const [gateOpen, setGateOpen] = useState(false);
   const [approvalPing, setApprovalPing] = useState(0);
   const [seedMessage, setSeedMessage] = useState<EmailMessage | null>(null);
+  const [assistantSeed, setAssistantSeed] = useState<string>("");
 
   if (loading) {
     return (
@@ -226,7 +230,17 @@ function Shell() {
       case "dashboard":
         return <DashboardPanel />;
       case "assistant":
-        return <AssistantPanel />;
+        return <AssistantPanel seed={assistantSeed} onSeedConsumed={() => setAssistantSeed("")} />;
+      case "workspace":
+        return (
+          <AppWorkspace
+            onAskAssistant={(prompt) => {
+              setAssistantSeed(prompt);
+              setSection("assistant");
+            }}
+            onGoToApps={() => setSection("apps")}
+          />
+        );
       case "apps":
         return <AppsPanel onNeedAuth={() => setGateOpen(true)} />;
       case "settings":

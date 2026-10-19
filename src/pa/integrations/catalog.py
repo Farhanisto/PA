@@ -120,8 +120,8 @@ def list_apps(limit: int | None = None, *, use_cache: bool = True) -> list[dict[
 def connection_states(user_id: str, slugs: list[str]) -> dict[str, str]:
     """Map slug -> connection state for one user, using a single batched call."""
     known = composio_client.connection_states(user_id)
-    if not known:
-        # Composio unreachable or not configured: report honestly, not "none".
+    if known is None:
+        # Composio unreachable: report honestly rather than "not connected".
         return {slug: "unavailable" for slug in slugs}
     return {slug: known.get(slug, "none") for slug in slugs}
 
