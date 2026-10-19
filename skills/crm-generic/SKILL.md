@@ -1,6 +1,8 @@
 ---
 name: crm-generic
 description: Work with any CRM in the catalog (Pipedrive, Zoho, Close, Attio, Monday, Zendesk, Freshdesk, Intercom, Airtable, Notion). Use when the user names a CRM other than HubSpot or Salesforce, or asks for a cross-CRM workflow.
+apps: [pipedrive, zoho, close, attio, monday, zendesk, freshdesk, intercom, airtable, notion, hubspot, salesforce]
+fallback: true
 ---
 
 # Generic CRM app

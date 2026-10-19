@@ -126,6 +126,24 @@ class DraftGenerateRequest(BaseModel):
     instructions: str = Field(default="", max_length=4000)
 
 
+class DraftComposeRequest(BaseModel):
+    """Draft a reply body from free-form context.
+
+    Used by the assistant chat, where the thing being replied to may be a
+    record in a connected app (a HubSpot engagement) rather than a message
+    PA has cached.
+    """
+
+    context: str = Field(min_length=1, max_length=8000)
+    sender: str = Field(default="", max_length=320)
+    subject: str = Field(default="", max_length=998)
+    instructions: str = Field(default="", max_length=4000)
+
+
+class DraftComposeResponse(BaseModel):
+    body: str
+
+
 # --- Observability ---
 
 

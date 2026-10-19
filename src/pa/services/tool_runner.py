@@ -207,7 +207,10 @@ def execute(user_id: str, slug: str, args: dict[str, Any]) -> dict[str, Any]:
         text = str(payload)
     if len(text) > MAX_RESULT_CHARS:
         text = text[:MAX_RESULT_CHARS] + " … (truncated)"
-    return {"tool": slug, "result": text}
+    # ``payload`` is the untruncated response, for callers that need structure
+    # (the assistant turns it into cards). It is popped before the result
+    # enters graph state, so it is never serialised or persisted raw.
+    return {"tool": slug, "result": text, "payload": payload}
 
 
 def _account_for(client, user_ref: str, tool_slug: str) -> str | None:
@@ -234,6 +237,22 @@ def _account_for(client, user_ref: str, tool_slug: str) -> str | None:
             return cid
         fallback = fallback or cid
     return fallback
+
+
+def execute_read(user_id: str, slug: str, args: dict | None = None) -> Any:
+    """Run a read tool for the caller's own account and return its payload.
+
+    Used for lookups that enrich a result (resolving a stage id to its
+    name). Write tools are refused outright: a lookup that quietly mutated a
+    record would be a nasty surprise.
+    """
+    index = tool_index(user_id)
+    if slug not in index:
+        raise ToolError(f"{slug} is not available for your connected apps.")
+    if index[slug].get("classification") != "read":
+        raise ToolError(f"{slug} is not a read tool.")
+    checked = validate(index, slug, args or {})
+    return execute(user_id, slug, checked).get("payload")
 
 
 def parse_tool_call(text: str) -> dict[str, Any] | None:

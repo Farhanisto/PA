@@ -266,9 +266,18 @@ def fake_composio():
     catalog_mod._catalog_cache["at"] = 0.0
     catalog_mod._catalog_cache["apps"] = None
     catalog_mod._tool_cache.clear()
+    # The app-name matcher is cached separately and must track the catalog.
+    catalog_mod.invalidate_mentions()
+    # Enrichment lookups are cached per user and tool; clear them so one
+    # test's lookup cannot leak into the next.
+    from pa.services import app_enrichment
+
+    app_enrichment._lookup_cache.clear()
     try:
         yield fake
     finally:
         composio_client.clear_client_factory()
         composio_client.invalidate_states()
         catalog_mod._tool_cache.clear()
+        catalog_mod.invalidate_mentions()
+        app_enrichment._lookup_cache.clear()

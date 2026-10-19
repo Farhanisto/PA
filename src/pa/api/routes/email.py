@@ -16,6 +16,8 @@ from pa.api.dependencies import get_current_user, get_db
 from pa.auth import PERM_READ_INBOX, PERM_SEND_EMAIL, permission_granted
 from pa.db.models import EmailDraft, EmailMessage
 from pa.schemas.auth import (
+    DraftComposeRequest,
+    DraftComposeResponse,
     DraftCreateRequest,
     DraftGenerateRequest,
     DraftResponse,
@@ -197,6 +199,51 @@ def generate_draft(
             raise HTTPException(status_code=404, detail=str(exc))
         rec["output"] = {"draft_id": draft.id, "subject": draft.subject}
     return _draft_response(draft)
+
+
+@router.post(
+    "/drafts/compose",
+    response_model=DraftComposeResponse,
+    summary="Draft a reply body from context",
+    description=(
+        "Generates a reply body for the caller to review and edit. The context "
+        "may be any record PA has surfaced (a HubSpot engagement, a message) "
+        "— nothing is sent, and no draft is created until the user asks for one."
+    ),
+)
+def compose_draft(
+    body: DraftComposeRequest,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    """Draft a reply body from free-form context.
+
+    This deliberately bypasses the agent loop: the assistant must not be able
+    to turn "draft a reply" into a tool call that sends something. Only the
+    body is generated here; sending always goes through the approval gate.
+    """
+    from pa.services.email_service import _model_invoker
+    from pa.services.email_triage import draft_reply
+
+    job_id = f"compose-{uuid.uuid4().hex[:12]}"
+    with tracing.trace_tool(
+        db,
+        user_id=user_id,
+        job_id=job_id,
+        tool_name="email_compose_draft",
+        args={"sender": body.sender, "subject": body.subject},
+    ) as rec:
+        text = draft_reply(
+            {
+                "from": body.sender,
+                "subject": body.subject,
+                "body": body.context,
+            },
+            instructions=body.instructions or "Reply appropriately.",
+            model_invoke=_model_invoker(),
+        )
+        rec["output"] = {"chars": len(text)}
+    return DraftComposeResponse(body=text)
 
 
 @router.get("/drafts", response_model=list[DraftResponse], summary="List my drafts")

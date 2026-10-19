@@ -36,9 +36,19 @@ class Job(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     user_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
     thread_id: Mapped[str] = mapped_column(String(36), unique=True, index=True, nullable=False)
+    # Groups the turns of one conversation. A thread is a single run; a
+    # conversation is the exchange around it, so a short answer to a
+    # clarifying question still knows what was being asked.
+    conversation_id: Mapped[str] = mapped_column(
+        String(64), index=True, nullable=False, default=""
+    )
     status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="queued")
     request: Mapped[str] = mapped_column(Text, nullable=False, default="")
     result: Mapped[str] = mapped_column(Text, nullable=True)
+    # Structured app records surfaced as cards in the chat (JSON list).
+    artifacts: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    # The record the user was acting on when this job was created (JSON).
+    focus: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     error_code: Mapped[str] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(

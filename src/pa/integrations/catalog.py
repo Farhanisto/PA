@@ -17,7 +17,7 @@ from pa.integrations import composio_client
 logger = logging.getLogger(__name__)
 
 # Apps we surface first, in this order, when present in the catalog.
-PREFERRED_ORDER = ("gmail", "outlook", "googlecalendar", "slack", "notion", "github")
+PREFERRED_ORDER = ("gmail", "hubspot", "outlook", "googlecalendar", "slack", "notion", "github")
 
 
 def _coerce(item: Any) -> dict[str, str] | None:
@@ -114,7 +114,103 @@ def list_apps(limit: int | None = None, *, use_cache: bool = True) -> list[dict[
     apps.sort(key=lambda a: (rank.get(a["slug"], 99), a["name"].lower()))
     _catalog_cache["apps"] = list(apps)
     _catalog_cache["at"] = time.monotonic()
+    # The name matcher is built from the catalog, so it must not outlive it.
+    invalidate_mentions()
     return apps[:limit] if limit else apps
+
+
+# --- Mentioning an app by name --------------------------------------------
+#
+# The assistant must only ever talk about apps the user has connected. A
+# prompt rule ("do not mention other apps") is not a boundary: a model asked
+# about "tickets" with no context will happily name a famous ticketing app
+# it has never been connected to. So the check is done here, against the
+# real catalog.
+
+# App names that are ordinary English words would match ordinary prose
+# ("a task for you", "send a mail"), so they are not treated as app
+# mentions. Everything else is a brand name and is safe to look for.
+_GENERIC_APP_NAMES = frozenset({
+    "asana", "chat", "chatgpt", "classroom", "cloud", "code", "contacts",
+    "drive", "docs", "dropbox", "forms", "groups", "keep", "mail", "maps",
+    "meet", "music", "news", "notes", "photos", "sheets", "sites", "slides",
+    "storage", "tasks", "teams", "translate", "weather", "youtube",
+})
+
+_MENTION_TTL_SECONDS = 300.0
+_mention_cache: dict[str, object] = {"at": 0.0, "regex": None, "names": {}}
+
+
+def invalidate_mentions() -> None:
+    """Drop the cached app-name matcher (it is built from the catalog)."""
+    _mention_cache.update({"at": 0.0, "regex": None, "names": {}})
+
+
+def _mention_pattern():
+    """Compiled matcher for app names in the catalog, plus name -> slug.
+
+    Cached alongside the catalog: rebuilding a thousand-alternative regex on
+    every response would be wasteful.
+    """
+    now = time.monotonic()
+    cached = _mention_cache.get("regex")
+    if cached is not None and (now - float(_mention_cache.get("at") or 0.0)) < _MENTION_TTL_SECONDS:
+        return cached
+
+    import re
+
+    names: dict[str, str] = {}
+    for app in list_apps():
+        slug = app["slug"]
+        label = (app.get("name") or "").strip()
+        # The slug is the most reliable name ("zendesk"), but a slug like
+        # "googlecalendar" is not how anyone writes it; keep the display
+        # name too.
+        for candidate in (label, slug.replace("-", " "), slug):
+            key = candidate.strip().lower()
+            if len(key) < 5 or key in _GENERIC_APP_NAMES:
+                continue
+            names.setdefault(key, slug)
+    if not names:
+        _mention_cache["at"] = now
+        _mention_cache["regex"] = None
+        _mention_cache["names"] = {}
+        return None
+    # Longest first so "google calendar" wins over "google".
+    ordered = sorted(names, key=len, reverse=True)
+    pattern = re.compile(
+        r"\b(?:" + "|".join(re.escape(n) for n in ordered) + r")\b", re.IGNORECASE
+    )
+    _mention_cache["at"] = now
+    _mention_cache["regex"] = pattern
+    _mention_cache["names"] = names
+    return pattern
+
+
+def mentioned_apps(text: str) -> list[str]:
+    """Slugs of the catalog apps named in ``text``.
+
+    Only distinctive brand names count, so ordinary prose is not mistaken
+    for an app mention.
+    """
+    if not text or not text.strip():
+        return []
+    pattern = _mention_pattern()
+    if pattern is None:
+        return []
+    names = _mention_cache.get("names") or {}
+    found: list[str] = []
+    for match in pattern.finditer(text):
+        slug = names.get(match.group(0).strip().lower())
+        if slug and slug not in found:
+            found.append(slug)
+    return found
+
+
+def mentioned_unconnected_apps(text: str, connected_slugs: list[str]) -> list[str]:
+    """Catalog apps named in ``text`` that the user has not connected."""
+    connected = {s.lower() for s in connected_slugs}
+    return [slug for slug in mentioned_apps(text) if slug not in connected]
 
 
 def connection_states(user_id: str, slugs: list[str]) -> dict[str, str]:

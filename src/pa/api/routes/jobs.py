@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from pa.api.dependencies import get_current_user, get_db
 from pa.db import repositories
-from pa.schemas.assistant import JobResponse
+from pa.schemas.assistant import ArtifactResponse, JobResponse
 
 router = APIRouter()
 
@@ -69,3 +69,25 @@ def get_job_status(
         started_at=job.started_at,
         finished_at=job.finished_at,
     )
+
+
+@router.get(
+    "/jobs/{job_id}/artifacts",
+    response_model=list[ArtifactResponse],
+    summary="Structured app records from a run",
+    description=(
+        "The app records a job surfaced — HubSpot engagements, contacts, "
+        "deals, ... — as cards the chat can render and the user can act on. "
+        "Empty for runs that surfaced no records."
+    ),
+)
+def job_artifacts(
+    job_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user)
+):
+    """Return the cards produced by one of the caller's jobs."""
+    job = repositories.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
+    if job.user_id != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not authorized")
+    return repositories.job_artifacts(job)

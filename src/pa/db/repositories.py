@@ -21,18 +21,72 @@ def _utcnow() -> datetime:
 # --- Jobs ---
 
 
-def create_job(db: Session, *, user_id: str, request: str, thread_id: str | None = None) -> Job:
+def create_job(
+    db: Session,
+    *,
+    user_id: str,
+    request: str,
+    thread_id: str | None = None,
+    conversation_id: str | None = None,
+    focus: dict[str, Any] | None = None,
+) -> Job:
     job = Job(
         id=str(uuid.uuid4()),
         user_id=user_id,
         thread_id=thread_id or str(uuid.uuid4()),
+        conversation_id=conversation_id or str(uuid.uuid4()),
         status="queued",
         request=request,
+        focus=json.dumps(focus or {}, default=str),
     )
     db.add(job)
     db.commit()
     db.refresh(job)
     return job
+
+
+def job_focus(job: Job) -> dict[str, Any]:
+    """The record the user was acting on when the job was created."""
+    try:
+        data = json.loads(job.focus or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def get_conversation_owner(
+    db: Session, *, user_id: str, conversation_id: str
+) -> str | None:
+    """The conversation id if the user owns it, else None.
+
+    Lets a client resume its own conversation without ever reaching
+    another user's.
+    """
+    if not conversation_id:
+        return None
+    stmt = select(Job.conversation_id).where(
+        Job.user_id == user_id, Job.conversation_id == conversation_id
+    )
+    return db.scalars(stmt).first()
+
+
+def list_jobs_for_conversation(
+    db: Session, *, user_id: str, conversation_id: str, limit: int = 20
+) -> list[Job]:
+    """The turns of one conversation, oldest first, scoped to its owner.
+
+    Scoped by user as well as conversation id: a client that guesses another
+    user's conversation id gets an empty history, never theirs.
+    """
+    if not conversation_id:
+        return []
+    stmt = (
+        select(Job)
+        .where(Job.user_id == user_id, Job.conversation_id == conversation_id)
+        .order_by(Job.created_at.asc())
+        .limit(max(1, min(limit, 100)))
+    )
+    return list(db.scalars(stmt).all())
 
 
 def get_job(db: Session, job_id: str) -> Job | None:
@@ -49,6 +103,7 @@ def update_job(
     *,
     status: str | None = None,
     result: str | None = None,
+    artifacts: list[dict[str, Any]] | None = None,
     error_code: str | None = None,
     started: bool = False,
     finished: bool = False,
@@ -59,6 +114,8 @@ def update_job(
         job.status = status
     if result is not None:
         job.result = result
+    if artifacts is not None:
+        job.artifacts = json.dumps(artifacts, default=str)
     if error_code is not None:
         job.error_code = error_code
     if started:
@@ -70,6 +127,21 @@ def update_job(
     db.commit()
     db.refresh(job)
     return job
+
+
+def job_artifacts(job: Job) -> list[dict[str, Any]]:
+    """The structured cards a job surfaced, as a list of dicts.
+
+    Parsing is defensive: a job written by an older build (or a corrupted
+    row) must not break the endpoint that serves these.
+    """
+    try:
+        data = json.loads(job.artifacts or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [x for x in data if isinstance(x, dict)]
 
 
 def try_claim_job(db: Session, job: Job) -> bool:

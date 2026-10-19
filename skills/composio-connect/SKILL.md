@@ -1,6 +1,7 @@
 ---
 name: composio-connect
 description: Connect or disconnect any app (Gmail, HubSpot, Slack, ...) via Composio OAuth, and inspect connection state. Use when the user wants to link an app account or check link status.
+triggers: [connect, disconnect, link, linked, sign in, sign-in, authorise, authorize, revoke, oauth]
 ---
 
 # Composio Connect

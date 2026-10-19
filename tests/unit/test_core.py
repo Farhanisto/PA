@@ -737,8 +737,18 @@ def test_plan_router_sends_reads_to_execution():
     from pa.graph import builder as b
 
     assert b.after_plan({"tool_call": {"classification": "read"}}) == "run_read_tool"
-    assert b.after_plan({"tool_call": {"classification": "write"}}) == "verify_result"
-    assert b.after_plan({}) == "verify_result"
+    # A write still needs a written response for the approval summary, so
+    # the prose is written before verification.
+    assert b.after_plan({"tool_call": {"classification": "write"}}) == "generate_response"
+    assert b.after_plan({}) == "generate_response"
+
+
+def test_a_tool_run_does_not_also_write_prose():
+    """The prose is overwritten by a tool's summary, so it is not written."""
+    from pa.graph import builder as b
+
+    # Reads go straight to the tool; there is no prose call on that path.
+    assert b.after_plan({"tool_call": {"classification": "read"}}) != "generate_response"
 
 
 def test_graph_builds():

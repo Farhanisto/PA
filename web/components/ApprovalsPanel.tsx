@@ -15,7 +15,19 @@ function describe(a: Approval): string {
     const subject = String(p.subject ?? "");
     return `Send email to ${to}${subject ? ` — “${subject}”` : ""}`;
   }
+  if (a.action === "composio_tool") {
+    return String(p.summary ?? `Run ${p.tool ?? "a tool"}`);
+  }
   return String(p.summary ?? p.request ?? a.action);
+}
+
+/** The exact arguments that will run, so the proposal can be checked. */
+function argsOf(a: Approval): Record<string, unknown> | null {
+  const p = a.payload ?? {};
+  if (a.action !== "composio_tool") return null;
+  const args = p.args;
+  if (!args || typeof args !== "object") return null;
+  return args as Record<string, unknown>;
 }
 
 export function ApprovalsPanel({
@@ -86,33 +98,46 @@ export function ApprovalsPanel({
       ) : null}
 
       <div className="list">
-        {items?.map((a) => (
-          <article key={a.approval_id} className="msg-card priority-high">
-            <div className="msg-head">
-              <Badge value={a.action} dot />
-              <span className="mono tiny muted">{a.approval_id.slice(0, 8)}</span>
-            </div>
-            <p>{describe(a)}</p>
-            <div className="row row-top">
-              <button
-                type="button"
-                className="btn btn-primary btn-sm"
-                disabled={acting !== null}
-                onClick={() => void decide(a.approval_id, "approve")}
-              >
-                {acting === a.approval_id + "approve" ? "Approving…" : "Approve & send"}
-              </button>
-              <button
-                type="button"
-                className="btn btn-sm"
-                disabled={acting !== null}
-                onClick={() => void decide(a.approval_id, "reject")}
-              >
-                Reject
-              </button>
-            </div>
-          </article>
-        ))}
+        {items?.map((a) => {
+          const args = argsOf(a);
+          return (
+            <article key={a.approval_id} className="msg-card priority-high">
+              <div className="msg-head">
+                <Badge value={a.action === "composio_tool" ? "app change" : a.action} dot />
+                <span className="mono tiny muted">{a.approval_id.slice(0, 8)}</span>
+              </div>
+              <p>{describe(a)}</p>
+              {args ? (
+                <details className="approval-args">
+                  <summary>Show the exact action</summary>
+                  <pre className="mono tiny">{JSON.stringify(args, null, 2)}</pre>
+                </details>
+              ) : null}
+              <div className="row row-top">
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  disabled={acting !== null}
+                  onClick={() => void decide(a.approval_id, "approve")}
+                >
+                  {acting === a.approval_id + "approve"
+                    ? "Approving…"
+                    : a.action === "email_send_draft"
+                      ? "Approve & send"
+                      : "Approve & run"}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={acting !== null}
+                  onClick={() => void decide(a.approval_id, "reject")}
+                >
+                  Reject
+                </button>
+              </div>
+            </article>
+          );
+        })}
       </div>
     </Card>
   );

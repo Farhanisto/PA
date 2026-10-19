@@ -63,7 +63,32 @@ def is_transient_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     if "timeout" in name or "connection" in name or "retry" in name:
         return True
-    return any(m in msg for m in TRANSIENT_MARKERS)
+    if any(m in msg for m in TRANSIENT_MARKERS):
+        return True
+    try:
+        from pa.models.errors import is_transient
+
+        return is_transient(exc)
+    except Exception:
+        return False
+
+
+def _retry_countdown(exc: Exception, retries: int) -> int:
+    """Seconds to wait before retrying.
+
+    A token-budget failure (413) or a rate limit (429) is a *per-minute*
+    budget: retrying in two seconds just fails again. Those wait for the
+    window to refill; anything else backs off quickly.
+    """
+    try:
+        from pa.models.errors import status_of
+
+        status = status_of(exc)
+    except Exception:
+        status = None
+    if status in (413, 429):
+        return 30 * (retries + 1)
+    return 2**retries
 
 
 def _job_log(db, job, event: str, details: dict | None = None) -> None:
@@ -122,6 +147,47 @@ def _run_graph(
         return graph.invoke(cmd, config=config)  # type: ignore[arg-type]
 
 
+def _conversation_history(db, job, limit: int = 10) -> list[dict]:
+    """The earlier turns of this conversation, oldest first.
+
+    A short answer ("tickets") is meaningless without the question it
+    answers, so the exchange is carried forward. Only the caller's own
+    turns are included.
+    """
+    try:
+        prior = repositories.list_jobs_for_conversation(
+            db, user_id=job.user_id, conversation_id=job.conversation_id, limit=limit
+        )
+    except Exception:
+        return []
+    history: list[dict] = []
+    for turn in prior:
+        if turn.id == job.id or not turn.request:
+            continue
+        history.append({"role": "user", "content": turn.request})
+        if turn.result:
+            history.append({"role": "assistant", "content": turn.result[:2000]})
+    return history
+
+
+def _friendly_error_code(err: str) -> str:
+    """A short, actionable error for the user; the full detail goes to the audit log.
+
+    "model_error: APIStatusError: status=413: Error code: 413 - {...}" tells the
+    user nothing they can act on.
+    """
+    if "model_error" in err:
+        try:
+            from pa.models.errors import FRIENDLY, status_of
+
+            status = status_of(Exception(err))
+            if status in FRIENDLY:
+                return FRIENDLY[status]
+        except Exception:
+            pass
+    return err[:128]
+
+
 @celery_app.task(bind=True, name="pa.run_assistant_job", max_retries=3)
 def run_assistant_job(self, job_id: str) -> dict:
     from pa.observability import log_event
@@ -176,6 +242,8 @@ def run_assistant_job(self, job_id: str) -> dict:
             "memory_snippets": snippets,
             "app_context": app_ctx["text"],
             "connected_apps": app_ctx["apps"],
+            "history": _conversation_history(db, job),
+            "focus": repositories.job_focus(job),
         }
         job_id, thread_id = job.id, job.thread_id
         # Release the read snapshot before the graph run: the checkpointer
@@ -234,12 +302,25 @@ def run_assistant_job(self, job_id: str) -> dict:
 
         if isinstance(final_state, dict) and final_state.get("error"):
             err = str(final_state["error"])
+            # The records the run already fetched are still worth showing.
+            artifacts = final_state.get("artifacts") or []
             if "model_error" in err and is_transient_error(Exception(err)):
                 try:
-                    raise self.retry(exc=Exception(err), countdown=2**self.request.retries)
+                    raise self.retry(
+                        exc=Exception(err),
+                        countdown=_retry_countdown(Exception(err), self.request.retries),
+                        max_retries=3,
+                    )
                 except Retry:
                     raise
-            repositories.update_job(db, job, status="failed", error_code=err[:128], finished=True)
+            repositories.update_job(
+                db,
+                job,
+                status="failed",
+                error_code=_friendly_error_code(err),
+                artifacts=artifacts,
+                finished=True,
+            )
             _job_log(db, job, "job.failed", {"error": err[:500], "latency_ms": latency_ms})
             return {"ok": False, "error": err}
 
@@ -252,7 +333,12 @@ def run_assistant_job(self, job_id: str) -> dict:
             return _handle_interrupt(db, job, final_state.get("proposed_action") or {})
 
         result_text = (final_state.get("response") or "") if isinstance(final_state, dict) else ""
-        repositories.update_job(db, job, status="completed", result=result_text, finished=True)
+        # Structured app records (HubSpot engagements, contacts, ...) the run
+        # surfaced. The chat renders these as cards the user can act on.
+        artifacts = (final_state.get("artifacts") or []) if isinstance(final_state, dict) else []
+        repositories.update_job(
+            db, job, status="completed", result=result_text, artifacts=artifacts, finished=True
+        )
         _job_log(db, job, "job.completed", {"latency_ms": latency_ms})
         log_event(
             logger,

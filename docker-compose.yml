@@ -29,7 +29,14 @@ services:
       retries: 15
 
   api:
-    build: .
+    build:
+      context: .
+      # The build needs PyPI; the default bridge network denies it,
+      # and the failure is silent-ish: the old image keeps running.
+      network: host
+    # One image for the api, worker and beat, so a rebuild cannot leave one
+    # of them running an older build than the others.
+    image: pa:local
     ports:
       - "127.0.0.1:8000:8000"
     environment:
@@ -60,7 +67,9 @@ services:
       retries: 12
 
   worker:
-    build: .
+    # Built by the api service; reusing one image means the worker and beat
+    # can never run an older build than the api.
+    image: pa:local
     command: celery -A pa.queue.celery_app:celery_app worker --loglevel=INFO --concurrency=1
     environment:
       APP_ENV: ${APP_ENV:-production}
@@ -87,7 +96,9 @@ services:
         condition: service_healthy
 
   beat:
-    build: .
+    # Built by the api service; reusing one image means the worker and beat
+    # can never run an older build than the api.
+    image: pa:local
     command: celery -A pa.queue.celery_app:celery_app beat --loglevel=INFO
     environment:
       APP_ENV: ${APP_ENV:-production}

@@ -33,13 +33,28 @@ def create_assistant_task(
     user_id: str = Depends(get_current_user),
 ):
     """Submit a prompt for background assistant execution."""
-    job = repositories.create_job(db, user_id=user_id, request=body.request.strip())
+    # A conversation id groups the turns of one exchange. It is only honoured
+    # when the caller owns it, so a guessed id cannot reach another user's
+    # history.
+    conversation_id = (body.conversation_id or "").strip()[:64]
+    if conversation_id and not repositories.get_conversation_owner(
+        db, user_id=user_id, conversation_id=conversation_id
+    ):
+        conversation_id = ""
+
+    job = repositories.create_job(
+        db,
+        user_id=user_id,
+        request=body.request.strip(),
+        conversation_id=conversation_id or None,
+        focus=body.focus.model_dump() if body.focus else None,
+    )
     audit_mod.record(
         db,
         event_type="job.accepted",
         user_id=user_id,
         job_id=job.id,
-        details={"thread_id": job.thread_id},
+        details={"thread_id": job.thread_id, "conversation_id": job.conversation_id},
     )
     # Enqueue background execution with only JSON-serializable IDs.
     try:
@@ -51,7 +66,12 @@ def create_assistant_task(
         # the job queued forever with no explanation.
         logger.exception("failed to enqueue assistant job %s", job.id)
         repositories.update_job(db, job, status="failed", error_code="enqueue_failed")
-    return AssistantTaskResponse(job_id=job.id, thread_id=job.thread_id, status=job.status)
+    return AssistantTaskResponse(
+        job_id=job.id,
+        thread_id=job.thread_id,
+        conversation_id=job.conversation_id,
+        status=job.status,
+    )
 
 
 @router.post(
@@ -91,6 +111,14 @@ def create_briefing_task(
         logger.exception("failed to enqueue briefing job %s", job.id)
         job = repositories.update_job(db, job, status="failed", error_code="enqueue_failed")
         return AssistantTaskResponse(
-            job_id=job.id, thread_id=job.thread_id, status=job.status
+            job_id=job.id,
+            thread_id=job.thread_id,
+            conversation_id=job.conversation_id,
+            status=job.status,
         )
-    return AssistantTaskResponse(job_id=job.id, thread_id=job.thread_id, status=job.status)
+    return AssistantTaskResponse(
+        job_id=job.id,
+        thread_id=job.thread_id,
+        conversation_id=job.conversation_id,
+        status=job.status,
+    )

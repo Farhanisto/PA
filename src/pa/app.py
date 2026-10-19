@@ -147,6 +147,60 @@ def create_app() -> FastAPI:
         status = "ready" if checks.get("database") == "ok" else "not_ready"
         return {"status": status, "checks": checks}
 
+    @app.get("/api/v1/diagnostics", tags=["ops"], summary="What this deployment has")
+    def diagnostics():
+        """Report the features this running build actually provides.
+
+        A deployment can be running an image that predates a feature, or a
+        database that has not been migrated. This makes that visible in one
+        call instead of showing up as a missing behaviour.
+        """
+        from sqlalchemy import inspect, text
+
+        report: dict[str, object] = {}
+
+        # Database: which revision, and does it have the columns the code needs?
+        try:
+            from pa.db.database import get_engine
+
+            engine = get_engine()
+            with engine.connect() as conn:
+                version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+            report["alembic_version"] = version
+
+            inspector = inspect(engine)
+            jobs_columns = (
+                {c["name"] for c in inspector.get_columns("jobs")}
+                if inspector.has_table("jobs")
+                else set()
+            )
+            report["jobs_columns"] = sorted(jobs_columns)
+            missing = [
+                c for c in ("artifacts", "conversation_id", "focus") if c not in jobs_columns
+            ]
+            report["schema_behind_code"] = missing
+        except Exception as exc:
+            report["database_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+
+        # Skills: the domain knowledge the assistant loads.
+        try:
+            from pa.services.skills import load_skills, skills_dir
+
+            loaded = load_skills()
+            report["skills"] = [s.name for s in loaded]
+            report["skills_dir"] = str(skills_dir()) if skills_dir() else None
+        except Exception as exc:
+            report["skills_error"] = f"{type(exc).__name__}"
+
+        # Features this build ships.
+        report["features"] = {
+            "cards": True,
+            "focus": True,
+            "skills": True,
+            "app_guard": True,
+        }
+        return report
+
     import os
 
     if os.getenv("PA_ENABLE_UI", "0") == "1":

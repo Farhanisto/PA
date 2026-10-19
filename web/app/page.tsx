@@ -226,11 +226,12 @@ function Shell() {
       );
     }
 
+    // The assistant is rendered separately (below) so it stays mounted across
+    // navigation: leaving for the Workspace and coming back must not throw
+    // away the conversation or its context.
     switch (section) {
       case "dashboard":
         return <DashboardPanel />;
-      case "assistant":
-        return <AssistantPanel seed={assistantSeed} onSeedConsumed={() => setAssistantSeed("")} />;
       case "workspace":
         return (
           <AppWorkspace
@@ -288,7 +289,19 @@ function Shell() {
       <main className="main">
         <div className="main-inner">
           {signedIn || PUBLIC_SECTIONS.has(section) ? (
-            body()
+            <>
+              {body()}
+              {signedIn ? (
+                // Always mounted, hidden when another section is open, so the
+                // conversation survives navigation.
+                <div hidden={section !== "assistant"}>
+                  <AssistantPanel
+                    seed={assistantSeed}
+                    onSeedConsumed={() => setAssistantSeed("")}
+                  />
+                </div>
+              ) : null}
+            </>
           ) : (
             <Gate section={section} onSignIn={() => setGateOpen(true)} />
           )}
