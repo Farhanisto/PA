@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from pa.api.dependencies import get_current_user_id, get_db
+from pa.api.dependencies import get_current_user, get_db
 from pa.memory import service as memory_service
 from pa.schemas.assistant import MemoryCreate, MemoryResponse
 
@@ -19,7 +19,7 @@ router = APIRouter()
 def list_memory(
     category: str | None = Query(default=None),
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user),
 ):
     """List stored memories scoped to the caller."""
     mems = memory_service.list_memories(db, user_id=user_id, category=category)
@@ -34,7 +34,7 @@ def list_memory(
     description="Saves a user-approved fact/preference. Credentials and secrets are refused.",
 )
 def create_memory(
-    body: MemoryCreate, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)
+    body: MemoryCreate, db: Session = Depends(get_db), user_id: str = Depends(get_current_user)
 ):
     """Save a new user-approved memory."""
     try:
@@ -53,7 +53,7 @@ def create_memory(
     description="Deletes an owned memory record. Returns 404 if missing, 403 if owned by another user.",
 )
 def delete_memory(
-    memory_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)
+    memory_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user)
 ):
     """Delete an owned memory."""
     try:

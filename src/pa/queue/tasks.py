@@ -2,8 +2,8 @@
 
 import json
 import logging
-import os
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 from celery.exceptions import Retry
@@ -45,30 +45,17 @@ def clear_model_override() -> None:
     _model_override = None
 
 
-class EchoFakeModel:
-    """Deterministic fallback for tests / when no provider key is configured."""
-
-    def __init__(self, prefix: str = "Echo response"):
-        self.prefix = prefix
-
-    def invoke(self, prompt: Any) -> Any:
-        text = prompt if isinstance(prompt, str) else str(prompt)
-
-        class Msg:
-            def __init__(self, content: str):
-                self.content = content
-
-        return Msg(f"{self.prefix}: {text[:500]}")
-
-
 def _resolve_task_model():
+    """Resolve the chat model for this run.
+
+    Production path is the configured provider (Groq/Nebius). Tests inject a
+    deterministic double via ``set_model_override``.
+    """
     if _model_override is not None:
         return _model_override() if callable(_model_override) else _model_override
-    if os.getenv("PA_FAKE_MODEL") == "1" or os.getenv("PRIVATEOS_FAKE_MODEL") == "1":
-        return EchoFakeModel()
-    from pa.models.nebius import create_nebius_model
+    from pa.models.factory import create_model
 
-    return create_nebius_model()
+    return create_model()
 
 
 def is_transient_error(exc: Exception) -> bool:
@@ -76,7 +63,32 @@ def is_transient_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     if "timeout" in name or "connection" in name or "retry" in name:
         return True
-    return any(m in msg for m in TRANSIENT_MARKERS)
+    if any(m in msg for m in TRANSIENT_MARKERS):
+        return True
+    try:
+        from pa.models.errors import is_transient
+
+        return is_transient(exc)
+    except Exception:
+        return False
+
+
+def _retry_countdown(exc: Exception, retries: int) -> int:
+    """Seconds to wait before retrying.
+
+    A token-budget failure (413) or a rate limit (429) is a *per-minute*
+    budget: retrying in two seconds just fails again. Those wait for the
+    window to refill; anything else backs off quickly.
+    """
+    try:
+        from pa.models.errors import status_of
+
+        status = status_of(exc)
+    except Exception:
+        status = None
+    if status in (413, 429):
+        return 30 * (retries + 1)
+    return 2**retries
 
 
 def _job_log(db, job, event: str, details: dict | None = None) -> None:
@@ -135,6 +147,47 @@ def _run_graph(
         return graph.invoke(cmd, config=config)  # type: ignore[arg-type]
 
 
+def _conversation_history(db, job, limit: int = 10) -> list[dict]:
+    """The earlier turns of this conversation, oldest first.
+
+    A short answer ("tickets") is meaningless without the question it
+    answers, so the exchange is carried forward. Only the caller's own
+    turns are included.
+    """
+    try:
+        prior = repositories.list_jobs_for_conversation(
+            db, user_id=job.user_id, conversation_id=job.conversation_id, limit=limit
+        )
+    except Exception:
+        return []
+    history: list[dict] = []
+    for turn in prior:
+        if turn.id == job.id or not turn.request:
+            continue
+        history.append({"role": "user", "content": turn.request})
+        if turn.result:
+            history.append({"role": "assistant", "content": turn.result[:2000]})
+    return history
+
+
+def _friendly_error_code(err: str) -> str:
+    """A short, actionable error for the user; the full detail goes to the audit log.
+
+    "model_error: APIStatusError: status=413: Error code: 413 - {...}" tells the
+    user nothing they can act on.
+    """
+    if "model_error" in err:
+        try:
+            from pa.models.errors import FRIENDLY, status_of
+
+            status = status_of(Exception(err))
+            if status in FRIENDLY:
+                return FRIENDLY[status]
+        except Exception:
+            pass
+    return err[:128]
+
+
 @celery_app.task(bind=True, name="pa.run_assistant_job", max_retries=3)
 def run_assistant_job(self, job_id: str) -> dict:
     from pa.observability import log_event
@@ -169,15 +222,38 @@ def run_assistant_job(self, job_id: str) -> dict:
             snippets = context_snippets(db, user_id=job.user_id)
         except Exception:
             snippets = []
+
+        # Which apps this user has actually connected, and their tools.
+        try:
+            from pa.services.app_context import connected_apps_context
+
+            app_ctx = connected_apps_context(job.user_id)
+        except Exception as exc:
+            log_event(
+                logger, logging.WARNING, "app context unavailable",
+                job_id=job.id, user_id=job.user_id,
+                details={"error": str(exc)[:200]},
+            )
+            app_ctx = {"text": "", "apps": [], "tools": {}}
+
         initial_state = {
             "user_id": job.user_id,
             "request": job.request,
             "memory_snippets": snippets,
+            "app_context": app_ctx["text"],
+            "connected_apps": app_ctx["apps"],
+            "history": _conversation_history(db, job),
+            "focus": repositories.job_focus(job),
         }
+        job_id, thread_id = job.id, job.thread_id
+        # Release the read snapshot before the graph run: the checkpointer
+        # may run DDL (Postgres CREATE INDEX CONCURRENTLY), which deadlocks
+        # against snapshots held by concurrent transactions.
+        db.commit()
 
         started = time.monotonic()
         try:
-            final_state = _run_graph(job_id, job.thread_id, initial_state)
+            final_state = _run_graph(job_id, thread_id, initial_state)
         except Exception as exc:
             # Detect LangGraph interrupt (approval pause) by class name to avoid
             # hard dependency on exact langgraph version.
@@ -226,12 +302,25 @@ def run_assistant_job(self, job_id: str) -> dict:
 
         if isinstance(final_state, dict) and final_state.get("error"):
             err = str(final_state["error"])
+            # The records the run already fetched are still worth showing.
+            artifacts = final_state.get("artifacts") or []
             if "model_error" in err and is_transient_error(Exception(err)):
                 try:
-                    raise self.retry(exc=Exception(err), countdown=2**self.request.retries)
+                    raise self.retry(
+                        exc=Exception(err),
+                        countdown=_retry_countdown(Exception(err), self.request.retries),
+                        max_retries=3,
+                    )
                 except Retry:
                     raise
-            repositories.update_job(db, job, status="failed", error_code=err[:128], finished=True)
+            repositories.update_job(
+                db,
+                job,
+                status="failed",
+                error_code=_friendly_error_code(err),
+                artifacts=artifacts,
+                finished=True,
+            )
             _job_log(db, job, "job.failed", {"error": err[:500], "latency_ms": latency_ms})
             return {"ok": False, "error": err}
 
@@ -244,7 +333,12 @@ def run_assistant_job(self, job_id: str) -> dict:
             return _handle_interrupt(db, job, final_state.get("proposed_action") or {})
 
         result_text = (final_state.get("response") or "") if isinstance(final_state, dict) else ""
-        repositories.update_job(db, job, status="completed", result=result_text, finished=True)
+        # Structured app records (HubSpot engagements, contacts, ...) the run
+        # surfaced. The chat renders these as cards the user can act on.
+        artifacts = (final_state.get("artifacts") or []) if isinstance(final_state, dict) else []
+        repositories.update_job(
+            db, job, status="completed", result=result_text, artifacts=artifacts, finished=True
+        )
         _job_log(db, job, "job.completed", {"latency_ms": latency_ms})
         log_event(
             logger,
@@ -295,6 +389,63 @@ def _handle_interrupt(db, job, proposal: dict) -> dict:
     return {"ok": True, "status": "waiting_for_approval", "approval_id": approval.id}
 
 
+def _execute_approved_tool(db, job, approval, payload: dict) -> dict:
+    """Run the exact Composio tool the user approved.
+
+    The payload was frozen when the approval was created, and it is re-validated
+    against the caller's connected apps here so a tampered record cannot widen
+    the blast radius.
+    """
+    from pa.services import tracing as _tracing
+    from pa.services.tool_runner import ToolError, execute, tool_index, validate
+
+    tool = payload.get("tool")
+    if not isinstance(tool, str) or not tool:
+        repositories.update_job(db, job, status="failed", error_code="bad_payload", finished=True)
+        return {"ok": False, "error": "approval payload missing tool"}
+
+    args = payload.get("args") or {}
+    if not isinstance(args, dict):
+        args = {}
+
+    try:
+        index = tool_index(job.user_id)
+        checked = validate(index, tool, args)
+        # Re-classify: if the tool is not a write it should never have been
+        # gated, but refuse rather than silently widening what runs.
+        if index[tool]["classification"] != "write":
+            raise ValueError(f"{tool} is not a write tool and cannot be approved here")
+
+        job_id = job.id
+        db.commit()
+        with _tracing.trace_tool(
+            db,
+            user_id=job.user_id,
+            job_id=job_id,
+            tool_name=tool,
+            args=checked,
+        ) as rec:
+            result = execute(job.user_id, tool, checked)
+            rec["output"] = {"result": result.get("result", "")[:2000]}
+    except ToolError as exc:
+        repositories.update_job(db, job, status="failed", error_code="tool_error", finished=True)
+        _job_log(db, job, "tool.failed", {"tool": tool, "error": str(exc)[:300]})
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        repositories.update_job(db, job, status="failed", error_code="tool_error", finished=True)
+        _job_log(db, job, "tool.failed", {"tool": tool, "error": str(exc)[:300]})
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+    summary = result.get("result", "")[:2000]
+    repositories.update_job(
+        db, job, status="completed",
+        result=f"Ran {tool} in {index[tool]['app']}.\n{summary}",
+        finished=True,
+    )
+    _job_log(db, job, "tool.approved_and_run", {"tool": tool, "approval_id": approval.id})
+    return {"ok": True, "status": "completed", "tool": tool}
+
+
 @celery_app.task(bind=True, name="pa.resume_approved_workflow", max_retries=3)
 def resume_approved_workflow(self, approval_id: str) -> dict:
     init_db()
@@ -311,16 +462,12 @@ def resume_approved_workflow(self, approval_id: str) -> dict:
             return {"ok": False, "error": "job_not_found"}
         if job.status == "completed":
             return {"ok": True, "status": "completed", "duplicate": True}
-        # Re-check policy/permissions immediately before side effect.
-        from pa.security.policy import is_action_allowed, requires_approval
-        from pa.tools.registry import is_allowed
-
         try:
             payload = json.loads(approval.payload or "{}")
         except json.JSONDecodeError:
             payload = {}
-        allowed = is_action_allowed(tool_name="approved_echo", user_id=job.user_id, args={})
-        if approval.user_id != job.user_id or not allowed:
+        allowed = approval.user_id == job.user_id
+        if not allowed:
             repositories.update_job(
                 db, job, status="failed", error_code="policy_denied", finished=True
             )
@@ -330,128 +477,266 @@ def resume_approved_workflow(self, approval_id: str) -> dict:
         repositories.update_job(db, job, status="running")
         _job_log(db, job, "job.resume_started", {"approval_id": approval.id})
 
-        # Idempotent side effect: only execute once per approval.
-        # If the stored proposal names an allowlisted integration tool,
-        # execute it with its stored args; otherwise fall back to the echo stub.
-        from pa.tools.registry import invoke_tool
-
-        tool_name = payload.get("tool") if isinstance(payload, dict) else None
-        tool_args = payload.get("args") if isinstance(payload, dict) else None
-        outcome = ""
+        # The only approved action is sending a reviewed email draft.
+        # Ownership, permission, and payload integrity are re-checked here,
+        # immediately before the send.
         try:
-            if (
-                isinstance(tool_name, str)
-                and is_allowed(tool_name)
-                and requires_approval(tool_name)
-                and isinstance(tool_args, dict)
-            ):
-                if not is_action_allowed(tool_name=tool_name, user_id=job.user_id, args=tool_args):
-                    raise ValueError(f"stored args rejected for {tool_name}")
-                outcome = invoke_tool(tool_name, tool_args)
-            else:
-                outcome = invoke_tool(
-                    "approved_echo",
-                    {
-                        "message": str(
-                            payload.get("summary") or payload.get("action") or approval.action
-                        )
-                    },
-                )
+            from pa.auth import PERM_SEND_EMAIL, permission_granted
+            from pa.services import email_service as email_svc
+            from pa.services import tracing as _tracing
+
+            if approval.action == "composio_tool":
+                return _execute_approved_tool(db, job, approval, payload)
+            if approval.action != "email_send_draft":
+                raise ValueError(f"unsupported approval action: {approval.action}")
+            if not permission_granted(db, user_id=job.user_id, key=PERM_SEND_EMAIL):
+                raise PermissionError("send permission denied")
+
+            draft_id = payload.get("draft_id")
+            if not isinstance(draft_id, str) or not draft_id:
+                raise ValueError("approval payload missing draft_id")
+
+            draft = email_svc.get_draft(db, user_id=job.user_id, draft_id=draft_id)
+            if draft.to_addr != payload.get("to_addr"):
+                raise ValueError("draft recipient changed since approval")
+
+            job_id = job.id
+            db.commit()
+            with _tracing.trace_tool(
+                db,
+                user_id=job.user_id,
+                job_id=job_id,
+                tool_name="email_send_draft",
+                args={"draft_id": draft_id, "to_addr": draft.to_addr},
+            ) as rec:
+                sent = email_svc.send_draft(db, user_id=job.user_id, draft_id=draft_id)
+                rec["output"] = {"sent_message_id": sent.sent_message_id}
+
+            result = (
+                f"Approved email sent to {draft.to_addr}.\n"
+                f"Subject: {draft.subject}\nProvider id: {sent.sent_message_id}"
+            )
+            repositories.update_job(db, job, status="completed", result=result, finished=True)
+            _job_log(
+                db,
+                job,
+                "email.sent_after_approval",
+                {"approval_id": approval.id, "draft_id": draft_id},
+            )
+            return {"ok": True, "status": "completed", "action": "email_send_draft"}
         except Exception as exc:
-            repositories.update_job(
-                db, job, status="failed", error_code="tool_error", finished=True
+            error_code = "permission_denied" if isinstance(exc, PermissionError) else "tool_error"
+            repositories.update_job(db, job, status="failed", error_code=error_code, finished=True)
+            _job_log(
+                db,
+                job,
+                "email.send_failed",
+                {"approval_id": approval.id, "error": f"{type(exc).__name__}: {exc}"[:500]},
             )
             return {"ok": False, "error": str(exc)[:500]}
-
-        try:
-            final_state = _run_graph(
-                job.id, job.thread_id, {}, resume_value={"decision": "approved"}
-            )
-        except Exception as exc:
-            if is_transient_error(exc):
-                try:
-                    raise self.retry(exc=exc, countdown=2**self.request.retries)
-                except Retry:
-                    raise
-            repositories.update_job(
-                db, job, status="failed", error_code="resume_failed", finished=True
-            )
-            return {"ok": False, "error": str(exc)[:500]}
-
-        prev_result = job.result or ""
-        response = (
-            (final_state.get("response") or prev_result)
-            if isinstance(final_state, dict)
-            else prev_result
-        )
-        combined = (response + f"\n\n[Approved action outcome: {outcome}]").strip()
-        repositories.update_job(db, job, status="completed", result=combined, finished=True)
-        _job_log(db, job, "job.completed_after_approval", {"approval_id": approval.id})
-        return {"ok": True, "status": "completed"}
     finally:
         db.close()
 
 
-@celery_app.task(bind=True, name="pa.run_daily_briefing", max_retries=3)
-def run_daily_briefing(self, user_id: str, scheduled_for: str = "") -> dict:
-    """Seeded briefing workflow: no third-party integrations in MVP."""
+# --- Proactive assistance (requirement §6) ---
+
+
+def _proactive_enabled(db, user_id: str) -> bool:
+    """Proactive work is opt-in per user (deny-by-default)."""
+    try:
+        from pa.auth import PERM_PROACTIVE, permission_granted
+
+        return permission_granted(db, user_id=user_id, key=PERM_PROACTIVE)
+    except Exception:
+        return False
+
+
+@celery_app.task(bind=True, name="pa.run_inbox_briefing", max_retries=2)
+def run_inbox_briefing(
+    self, user_id: str, scheduled_for: str = "", job_id: str | None = None
+) -> dict:
+    """Build (never send) a proactive inbox briefing for one user."""
     from pa.observability import log_event
+    from pa.services import proactive
 
     init_db()
-    factory = get_session_factory()
-    db = factory()
+    db = get_session_factory()
     try:
-        try:
-            snippets = context_snippets(db, user_id=user_id)
-        except Exception:
-            snippets = []
-        try:
-            from pa.memory.service import list_memories as _list
+        db = db()
+        if not _proactive_enabled(db, user_id):
+            log_event(logger, logging.INFO, "proactive briefing skipped", user_id=user_id)
+            return {"ok": True, "skipped": "proactive_disabled"}
 
-            seeded_tasks = [m.content for m in _list(db, user_id=user_id, category="task")[:10]]
-            seeded_notes = [m.content for m in _list(db, user_id=user_id, category="note")[:10]]
-        except Exception:
-            seeded_tasks, seeded_notes = [], []
-        from pa.tools.briefing import build_briefing
+        jid = job_id or f"briefing-{user_id[:8]}"
+        started = time.monotonic()
+        try:
+            result = proactive.build_inbox_briefing(db, user_id=user_id, job_id=jid)
+        except Exception as exc:
+            if is_transient_error(exc):
+                raise self.retry(exc=exc, countdown=2**self.request.retries)
+            raise
 
-        notes = seeded_notes + ([f"Scheduled for {scheduled_for}"] if scheduled_for else [])
-        draft = build_briefing(tasks=seeded_tasks, notes=notes, preferences=snippets)
+        latency_ms = int((time.monotonic() - started) * 1000)
+        if job_id:
+            job = repositories.get_job(db, job_id)
+            if job is not None and job.user_id == user_id:
+                repositories.update_job(
+                    db,
+                    job,
+                    status="completed",
+                    result=result["text"],
+                    artifacts=result.get("cards") or [],
+                    finished=True,
+                )
+        _job_log(db, job, "email.briefing_ready", {"counts": result["counts"]} if job else {})
         log_event(
             logger,
             logging.INFO,
-            "briefing draft built",
+            "inbox briefing built",
             user_id=user_id,
-            extra={"tasks": len(seeded_tasks), "notes": len(notes)},
+            extra={"latency_ms": latency_ms, "counts": result["counts"]},
         )
-        # Try model polish, fall back to draft on provider failure.
+        return {"ok": True, "text": result["text"], "counts": result["counts"]}
+    finally:
         try:
-            model = _resolve_task_model()
-            t0 = time.monotonic()
-            prompt = f"Polish this briefing concisely:\n\n{draft}"
-            res = model.invoke(prompt) if hasattr(model, "invoke") else model(prompt)
-            polished = getattr(res, "content", res)
-            final = str(polished).strip() or draft
+            db.close()
+        except Exception:
+            pass
+
+
+@celery_app.task(name="pa.run_followup_reminders", max_retries=2)
+def run_followup_reminders() -> dict:
+    """Fan out follow-up reminders for every user with proactive enabled."""
+    from pa.observability import log_event
+    from pa.services import proactive
+
+    init_db()
+    session = get_session_factory()()
+    try:
+        users = repositories.list_active_user_ids(session)
+    finally:
+        session.close()
+
+    delivered = 0
+    skipped = 0
+    for user_id in users:
+        session = get_session_factory()()
+        try:
+            if not _proactive_enabled(session, user_id):
+                skipped += 1
+                continue
+            data = proactive.build_followup_reminders(session, user_id=user_id)
+            if data["count"]:
+                repositories.create_audit_event(
+                    session,
+                    event_type="email.followup_reminders",
+                    user_id=user_id,
+                    details={"count": data["count"], "text": data["text"][:2000]},
+                )
+                delivered += 1
+            else:
+                skipped += 1
+        except Exception as exc:
             log_event(
                 logger,
-                logging.INFO,
-                "briefing polished",
+                logging.WARNING,
+                "followup reminder failed",
                 user_id=user_id,
-                extra={"latency_ms": int((time.monotonic() - t0) * 1000)},
+                extra={"error": str(exc)[:200]},
             )
-        except Exception as exc:
-            if is_transient_error(exc):
-                try:
-                    raise self.retry(exc=exc, countdown=2**self.request.retries)
-                except Retry:
-                    raise
-            log_event(logger, logging.WARNING, "briefing polish fallback", user_id=user_id)
-            final = draft
-        job = repositories.create_job(
-            db, user_id=user_id, request=f"Daily briefing {scheduled_for}".strip()
-        )
-        repositories.update_job(db, job, status="completed", result=final, finished=True)
-        _job_log(db, job, "briefing.completed", {"scheduled_for": scheduled_for})
-        log_event(logger, logging.INFO, "briefing completed", job_id=job.id, user_id=user_id)
-        return {"ok": True, "job_id": job.id, "result": final}
+        finally:
+            session.close()
+    log_event(
+        logger,
+        logging.INFO,
+        "followups complete",
+        extra={"delivered": delivered, "skipped": skipped},
+    )
+    return {"ok": True, "delivered": delivered, "skipped": skipped}
+
+
+@celery_app.task(name="pa.run_inbox_briefings", max_retries=2)
+def run_inbox_briefings(scheduled_for: str = "") -> dict:
+    """Beat fan-out: enqueue one inbox briefing per proactive-enabled user."""
+    from pa.observability import log_event
+
+    init_db()
+    session = get_session_factory()()
+    try:
+        users = repositories.list_active_user_ids(session)
     finally:
-        db.close()
+        session.close()
+
+    enqueued = []
+    for user_id in users:
+        try:
+            run_inbox_briefing.delay(user_id, scheduled_for or "")
+            enqueued.append(user_id)
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "briefing fan-out failed",
+                user_id=user_id,
+                extra={"error": str(exc)[:200]},
+            )
+    return {"ok": True, "enqueued": enqueued}
+
+
+def _is_due(schedule, *, which: str, now_local) -> bool:
+    """True when a user's chosen local time falls inside this dispatcher window."""
+    if which == "briefing":
+        if not schedule.briefing_enabled:
+            return False
+        hour, minute = schedule.briefing_hour, schedule.briefing_minute
+    else:
+        if not schedule.followup_enabled:
+            return False
+        hour, minute = schedule.followup_hour, schedule.followup_minute
+    target = hour * 60 + minute
+    current = now_local.hour * 60 + now_local.minute
+    # Beat runs every 15 minutes; fire once when we cross the target.
+    return target <= current < target + 15
+
+
+@celery_app.task(name="pa.dispatch_due_updates")
+def dispatch_due_updates() -> dict:
+    """Fan out one briefing/follow-up per user at *their* chosen local time.
+
+    Celery's crontab is global, so it cannot express per-user times; this
+    dispatcher runs frequently and fires each user once their local window
+    is reached.
+    """
+    from pa.observability import log_event
+
+    init_db()
+    session = get_session_factory()()
+    sent: dict[str, list[str]] = {"briefing": [], "followup": []}
+    try:
+        for schedule in repositories.list_schedules(session):
+            try:
+                from zoneinfo import ZoneInfo
+
+                now_local = datetime.now(ZoneInfo(schedule.timezone))
+            except Exception:
+                now_local = datetime.now(UTC)
+
+            if _is_due(schedule, which="briefing", now_local=now_local):
+                try:
+                    run_inbox_briefing.delay(schedule.user_id, now_local.isoformat())
+                    sent["briefing"].append(schedule.user_id)
+                except Exception as exc:
+                    log_event(logger, "briefing_enqueue_failed", user_id=schedule.user_id,
+                              details={"error": str(exc)[:200]})
+            if _is_due(schedule, which="followup", now_local=now_local):
+                try:
+                    from pa.services import proactive
+
+                    proactive.build_followup_reminders(session, user_id=schedule.user_id)
+                    sent["followup"].append(schedule.user_id)
+                except Exception as exc:
+                    log_event(logger, "followup_failed", user_id=schedule.user_id,
+                              details={"error": str(exc)[:200]})
+    finally:
+        session.close()
+    return {"dispatched": sent}

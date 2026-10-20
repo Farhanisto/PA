@@ -1,12 +1,15 @@
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PA_SKILLS_DIR=/app/skills
 
 WORKDIR /app
 
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
+# The assistant's skills: domain knowledge per app, loaded at runtime.
+COPY skills ./skills
 
 RUN pip install --no-cache-dir .
 

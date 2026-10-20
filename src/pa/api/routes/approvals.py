@@ -2,16 +2,37 @@
 
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from pa.api.dependencies import get_current_user_id, get_db
+from pa.api.dependencies import get_current_user, get_db
 from pa.db import repositories
 from pa.schemas.assistant import ApprovalResponse
 from pa.security import approvals as approvals_sec
 from pa.security import audit as audit_mod
 
 router = APIRouter()
+
+
+@router.get(
+    "/approvals",
+    response_model=list[ApprovalResponse],
+    summary="List my approvals",
+    description="Newest first, scoped to the caller. Filter by status (default `pending`).",
+)
+def list_my_approvals(
+    status_filter: str | None = Query(default="pending", alias="status"),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    """List the caller's approvals, newest first."""
+    if status_filter is not None and status_filter not in ("pending", "approved", "rejected"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid status")
+    approvals = repositories.list_approvals_for_user(
+        db, user_id=user_id, status=status_filter, limit=limit
+    )
+    return [_to_response(a) for a in approvals]
 
 
 def _to_response(approval) -> ApprovalResponse:
@@ -53,7 +74,7 @@ def _load_owned(db: Session, approval_id: str, user_id: str):
     ),
 )
 def approve(
-    approval_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)
+    approval_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user)
 ):
     """Approve a pending action and resume the paused workflow."""
     approval = _load_owned(db, approval_id, user_id)
@@ -89,7 +110,7 @@ def approve(
     ),
 )
 def reject(
-    approval_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)
+    approval_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user)
 ):
     """Reject a pending action; the paused job is marked failed."""
     approval = _load_owned(db, approval_id, user_id)

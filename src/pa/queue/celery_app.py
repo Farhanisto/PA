@@ -3,6 +3,8 @@
 import os
 
 from celery import Celery
+from celery.schedules import crontab
+from celery.signals import worker_ready
 
 from pa.config import get_settings
 
@@ -34,4 +36,27 @@ celery_app.conf.update(
     result_expires=3600,
     timezone="Africa/Nairobi",
     enable_utc=True,
+    beat_schedule={
+        # Per-user times cannot be expressed in crontab, so a dispatcher runs
+        # every 15 minutes and fans out one task per user whose local time has
+        # arrived. See pa.dispatch_due_updates.
+        "dispatch-due-updates": {
+            "task": "pa.dispatch_due_updates",
+            "schedule": crontab(minute="*/15"),
+        },
+    },
 )
+
+
+@worker_ready.connect
+def _worker_init(**kwargs) -> None:
+    """Prepare durable stores before consuming tasks (best-effort)."""
+    try:
+        from pa.db.database import init_db
+
+        init_db()
+        from pa.graph.checkpointer import ensure_schema
+
+        ensure_schema()
+    except Exception:
+        pass
